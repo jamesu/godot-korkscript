@@ -1,0 +1,3 @@
+[submodule "ext/korkscript"]
+	path = ext/korkscript
+	url = git@github.com:jamesu/korkscript.git
