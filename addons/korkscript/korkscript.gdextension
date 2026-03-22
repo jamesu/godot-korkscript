@@ -1,0 +1,12 @@
+[configuration]
+entry_symbol = "korkscript_library_init"
+compatibility_minimum = "4.2"
+reloadable = true
+
+[libraries]
+linux.debug.x86_64 = "res://addons/korkscript/korkscript_godot.so"
+linux.release.x86_64 = "res://addons/korkscript/korkscript_godot.so"
+macos.debug = "res://addons/korkscript/korkscript_godot.dylib"
+macos.release = "res://addons/korkscript/korkscript_godot.dylib"
+windows.debug.x86_64 = "res://addons/korkscript/korkscript_godot.dll"
+windows.release.x86_64 = "res://addons/korkscript/korkscript_godot.dll"
