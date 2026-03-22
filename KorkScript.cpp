@@ -19,8 +19,29 @@ struct KorkScriptInstance {
     Ref<KorkScript> script;
     KorkScriptVMHost *host = nullptr;
     KorkApi::VMObject *vm_object = nullptr;
+    uint64_t host_generation = 0;
     bool in_native_fallback = false;
 };
+
+bool sync_instance_vm_object(KorkScriptInstance *instance) {
+    if (instance == nullptr || instance->host == nullptr || !instance->script.is_valid() || instance->owner == nullptr) {
+        return false;
+    }
+
+    if (!instance->host->ensure_script_loaded(instance->script.ptr())) {
+        return false;
+    }
+
+    const uint64_t generation = instance->host->get_generation();
+    if (instance->vm_object != nullptr && instance->host_generation == generation) {
+        return true;
+    }
+
+    instance->vm_object = nullptr;
+    instance->vm_object = instance->host->create_vm_object_for(instance->owner, instance->script.ptr());
+    instance->host_generation = generation;
+    return instance->vm_object != nullptr;
+}
 
 void set_call_error(GDExtensionCallError *r_error, GDExtensionCallErrorType error_type, int32_t argument = -1, int32_t expected = 0) {
     if (r_error == nullptr) {
@@ -92,7 +113,7 @@ GDExtensionInt instance_get_method_argument_count(GDExtensionScriptInstanceDataP
 
 void instance_call(GDExtensionScriptInstanceDataPtr p_self, GDExtensionConstStringNamePtr p_method, const GDExtensionConstVariantPtr *p_args, GDExtensionInt p_argument_count, GDExtensionVariantPtr r_return, GDExtensionCallError *r_error) {
     KorkScriptInstance *instance = static_cast<KorkScriptInstance *>(p_self);
-    if (instance == nullptr || instance->host == nullptr || instance->vm_object == nullptr) {
+    if (!sync_instance_vm_object(instance)) {
         set_call_error(r_error, GDEXTENSION_CALL_ERROR_INVALID_METHOD);
         return;
     }
@@ -143,6 +164,9 @@ void instance_notification(GDExtensionScriptInstanceDataPtr p_instance, int32_t 
     if (instance == nullptr || !instance->script.is_valid() || !instance->script->has_method_name("_notification")) {
         return;
     }
+    if (!sync_instance_vm_object(instance)) {
+        return;
+    }
 
     Variant arg = p_what;
     const Variant *args[] = { &arg };
@@ -182,8 +206,12 @@ void instance_free(GDExtensionScriptInstanceDataPtr p_instance) {
     if (instance == nullptr) {
         return;
     }
-    if (instance->host != nullptr && instance->vm_object != nullptr) {
-        instance->host->destroy_vm_object_for(instance->owner, instance->vm_object);
+    if (instance->host != nullptr && instance->vm_object != nullptr &&
+            instance->host_generation == instance->host->get_generation()) {
+        instance->host->destroy_vm_object_for(instance->owner, instance->script.ptr(), instance->vm_object);
+    }
+    if (instance->host != nullptr) {
+        instance->host->release_script(instance->script.ptr());
     }
     memdelete(instance);
 }
@@ -226,6 +254,7 @@ std::string string_name_key(const StringName &name) {
 
 KorkScript::KorkScript() :
         vm_name_("default"),
+        namespace_name_(""),
         base_type_("Node"),
         revision_(1) {
 }
@@ -237,11 +266,20 @@ void KorkScript::set_source_code(const String &source) {
     source_code_ = source;
     ++revision_;
     refresh_method_cache();
+    KorkScriptLanguage *language = KorkScriptLanguage::get_singleton();
+    if (language != nullptr) {
+        language->notify_script_changed(this);
+    }
     emit_changed();
 }
 
 void KorkScript::set_vm_name(const String &vm_name) {
     vm_name_ = vm_name.is_empty() ? String("default") : vm_name;
+    emit_changed();
+}
+
+void KorkScript::set_namespace_name(const String &namespace_name) {
+    namespace_name_ = namespace_name.strip_edges();
     emit_changed();
 }
 
@@ -252,6 +290,10 @@ void KorkScript::set_base_type(const String &base_type) {
 
 const String &KorkScript::get_vm_name() const {
     return vm_name_;
+}
+
+const String &KorkScript::get_namespace_name() const {
+    return namespace_name_;
 }
 
 const String &KorkScript::get_base_type() const {
@@ -301,7 +343,9 @@ void *KorkScript::_instance_create(Object *p_for_object) const {
     instance->owner = p_for_object;
     instance->script = Ref<KorkScript>(const_cast<KorkScript *>(this));
     instance->host = host;
-    instance->vm_object = host->create_vm_object_for(p_for_object);
+    instance->host->retain_script(this);
+    instance->vm_object = host->create_vm_object_for(p_for_object, this);
+    instance->host_generation = host->get_generation();
     return gdextension_interface::script_instance_create3(&script_instance_info, instance);
 }
 
@@ -328,6 +372,10 @@ void KorkScript::_set_source_code(const String &p_code) {
 Error KorkScript::_reload(bool) {
     ++revision_;
     refresh_method_cache();
+    KorkScriptLanguage *language = KorkScriptLanguage::get_singleton();
+    if (language != nullptr) {
+        language->notify_script_changed(this);
+    }
     emit_changed();
     return OK;
 }
@@ -401,12 +449,15 @@ TypedArray<Dictionary> KorkScript::_get_script_property_list() const {
 void KorkScript::_bind_methods() {
     ClassDB::bind_method(D_METHOD("set_vm_name", "vm_name"), &KorkScript::set_vm_name);
     ClassDB::bind_method(D_METHOD("get_vm_name"), &KorkScript::get_vm_name);
+    ClassDB::bind_method(D_METHOD("set_namespace_name", "namespace_name"), &KorkScript::set_namespace_name);
+    ClassDB::bind_method(D_METHOD("get_namespace_name"), &KorkScript::get_namespace_name);
     ClassDB::bind_method(D_METHOD("set_base_type", "base_type"), &KorkScript::set_base_type);
     ClassDB::bind_method(D_METHOD("get_base_type"), &KorkScript::get_base_type);
     ClassDB::bind_method(D_METHOD("set_source_code", "source_code"), &KorkScript::set_source_code);
     ClassDB::bind_method(D_METHOD("get_source_code"), &KorkScript::_get_source_code);
     ADD_PROPERTY(PropertyInfo(Variant::STRING, "source_code", PROPERTY_HINT_MULTILINE_TEXT), "set_source_code", "get_source_code");
     ADD_PROPERTY(PropertyInfo(Variant::STRING, "vm_name"), "set_vm_name", "get_vm_name");
+    ADD_PROPERTY(PropertyInfo(Variant::STRING, "namespace_name"), "set_namespace_name", "get_namespace_name");
     ADD_PROPERTY(PropertyInfo(Variant::STRING, "base_type"), "set_base_type", "get_base_type");
 }
 

@@ -7,6 +7,7 @@
 
 namespace godot {
 
+class KorkScript;
 class KorkScriptVMHost;
 
 class KorkScriptLanguage : public ScriptLanguageExtension {
@@ -18,6 +19,7 @@ public:
 
     static KorkScriptLanguage *get_singleton();
     KorkScriptVMHost *get_vm_host(const String &vm_name);
+    void notify_script_changed(const KorkScript *script);
 
     String _get_name() const override;
     void _init() override;

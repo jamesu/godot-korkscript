@@ -9,6 +9,7 @@
 #include <memory>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 namespace godot {
 
@@ -22,11 +23,15 @@ public:
 
     KorkApi::Vm *get_vm() const;
     const String &get_vm_name() const;
+    uint64_t get_generation() const;
 
     bool ensure_script_loaded(const KorkScript *script);
+    void notify_script_changed(const KorkScript *script);
+    void retain_script(const KorkScript *script);
+    void release_script(const KorkScript *script);
 
-    KorkApi::VMObject *create_vm_object_for(Object *owner);
-    void destroy_vm_object_for(Object *owner, KorkApi::VMObject *vm_object);
+    KorkApi::VMObject *create_vm_object_for(Object *owner, const KorkScript *script);
+    void destroy_vm_object_for(Object *owner, const KorkScript *script, KorkApi::VMObject *vm_object);
 
     bool call_method(KorkApi::VMObject *vm_object, const StringName &method, const Variant **args, GDExtensionInt arg_count, Variant &ret) const;
 
@@ -34,6 +39,11 @@ public:
     bool set_property(Object *owner, const StringName &property, const Variant &value) const;
 
 private:
+    struct ActiveScriptState {
+        const KorkScript *script = nullptr;
+        uint32_t ref_count = 0;
+    };
+
     struct ScriptLoadState {
         uint64_t revision = 0;
     };
@@ -50,9 +60,14 @@ private:
     static KorkApi::ConsoleValue object_set_callback(void *obj, void *user_ptr, int32_t argc, KorkApi::ConsoleValue argv[]);
     static KorkApi::ConsoleValue object_print_callback(void *obj, void *user_ptr, int32_t argc, KorkApi::ConsoleValue argv[]);
 
+    void initialize_vm();
+    void reset_vm();
+    bool eval_script_source(const KorkScript *script);
+    bool reload_known_scripts(const KorkScript *extra_script = nullptr);
     KorkApi::NamespaceId ensure_namespace_for_class(const StringName &class_name);
     void ensure_object_bridge_namespace();
     KorkApi::SimObjectId ensure_sim_object_id(Object *owner);
+    KorkApi::NamespaceId resolve_object_namespace(Object *owner, const KorkScript *script);
     void register_vm_object(Object *owner, KorkApi::VMObject *vm_object, KorkApi::SimObjectId sim_id);
     void unregister_vm_object(Object *owner, KorkApi::VMObject *vm_object);
 
@@ -80,8 +95,14 @@ private:
     mutable std::unordered_map<uint64_t, KorkApi::SimObjectId> sim_ids_;
     std::unordered_map<KorkApi::SimObjectId, KorkApi::VMObject *> vm_objects_by_id_;
     std::unordered_map<std::string, KorkApi::VMObject *> vm_objects_by_name_;
+    std::unordered_map<std::string, KorkApi::VMObject *> vm_objects_by_path_;
+    std::unordered_map<uint64_t, ActiveScriptState> active_scripts_;
+    std::unordered_map<uint64_t, const KorkScript *> known_scripts_;
     std::unordered_map<uint64_t, ScriptLoadState> loaded_scripts_;
+    std::vector<KorkApi::Vm *> retired_vms_;
     KorkApi::SimObjectId next_sim_id_;
+    uint64_t generation_;
+    bool reload_pending_;
 };
 
 } // namespace godot

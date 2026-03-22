@@ -18,9 +18,11 @@ public:
 
     void set_source_code(const String &source);
     void set_vm_name(const String &vm_name);
+    void set_namespace_name(const String &namespace_name);
     void set_base_type(const String &base_type);
 
     const String &get_vm_name() const;
+    const String &get_namespace_name() const;
     const String &get_base_type() const;
     uint64_t get_revision() const;
     bool has_method_name(const StringName &method) const;
@@ -61,6 +63,7 @@ private:
 
     String source_code_;
     String vm_name_;
+    String namespace_name_;
     String base_type_;
     uint64_t revision_;
     std::unordered_set<std::string> method_names_;

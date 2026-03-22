@@ -39,6 +39,17 @@ KorkScriptVMHost *KorkScriptLanguage::get_vm_host(const String &vm_name) {
     return host_ptr;
 }
 
+void KorkScriptLanguage::notify_script_changed(const KorkScript *script) {
+    if (script == nullptr) {
+        return;
+    }
+
+    KorkScriptVMHost *host = get_vm_host(script->get_vm_name());
+    if (host != nullptr) {
+        host->notify_script_changed(script);
+    }
+}
+
 String KorkScriptLanguage::_get_name() const {
     return "KorkScript";
 }

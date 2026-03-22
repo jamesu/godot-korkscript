@@ -26,6 +26,15 @@ bool korkscript_debug_types_enabled() {
     return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
 }
 
+std::string make_node_path_key(Node *node) {
+    if (node == nullptr || !node->is_inside_tree()) {
+        return std::string();
+    }
+
+    const CharString utf8 = String(node->get_path()).utf8();
+    return std::string(utf8.get_data(), static_cast<size_t>(utf8.length()));
+}
+
 String format_component(double value) {
     char buffer[64];
     std::snprintf(buffer, sizeof(buffer), "%.9g", value);
@@ -285,7 +294,13 @@ KorkScriptVMHost::KorkScriptVMHost(const String &vm_name) :
         vector3_type_id_(-1),
         vector4_type_id_(-1),
         color_type_id_(-1),
-        next_sim_id_(1) {
+        next_sim_id_(1),
+        generation_(1),
+        reload_pending_(false) {
+    initialize_vm();
+}
+
+void KorkScriptVMHost::initialize_vm() {
     KorkApi::Config cfg{};
     cfg.mallocFn = [](size_t size, void *) -> void * {
         return std::malloc(size);
@@ -363,6 +378,12 @@ KorkScriptVMHost::~KorkScriptVMHost() {
         KorkApi::destroyVM(vm_);
         vm_ = nullptr;
     }
+    for (KorkApi::Vm *retired_vm : retired_vms_) {
+        if (retired_vm != nullptr) {
+            KorkApi::destroyVM(retired_vm);
+        }
+    }
+    retired_vms_.clear();
 }
 
 KorkApi::Vm *KorkScriptVMHost::get_vm() const {
@@ -373,16 +394,30 @@ const String &KorkScriptVMHost::get_vm_name() const {
     return vm_name_;
 }
 
-bool KorkScriptVMHost::ensure_script_loaded(const KorkScript *script) {
+uint64_t KorkScriptVMHost::get_generation() const {
+    return generation_;
+}
+
+void KorkScriptVMHost::reset_vm() {
+    if (vm_ != nullptr) {
+        retired_vms_.push_back(vm_);
+        vm_ = nullptr;
+    }
+
+    vm_objects_by_id_.clear();
+    vm_objects_by_name_.clear();
+    vm_objects_by_path_.clear();
+    loaded_scripts_.clear();
+    ++generation_;
+    initialize_vm();
+}
+
+bool KorkScriptVMHost::eval_script_source(const KorkScript *script) {
     if (script == nullptr || vm_ == nullptr) {
         return false;
     }
 
-    const uint64_t key = reinterpret_cast<uint64_t>(script);
-    ScriptLoadState &state = loaded_scripts_[key];
-    if (state.revision == script->get_revision()) {
-        return true;
-    }
+    known_scripts_[reinterpret_cast<uint64_t>(script)] = script;
 
     const CharString source_utf8 = script->get_source_code().utf8();
     String path = script->get_path();
@@ -398,24 +433,124 @@ bool KorkScriptVMHost::ensure_script_loaded(const KorkScript *script) {
         return false;
     }
 
-    state.revision = script->get_revision();
+    loaded_scripts_[reinterpret_cast<uint64_t>(script)].revision = script->get_revision();
     return true;
 }
 
-KorkApi::VMObject *KorkScriptVMHost::create_vm_object_for(Object *owner) {
+bool KorkScriptVMHost::reload_known_scripts(const KorkScript *extra_script) {
+    for (const auto &entry : known_scripts_) {
+        if (!eval_script_source(entry.second)) {
+            return false;
+        }
+    }
+
+    if (extra_script != nullptr) {
+        const uint64_t key = reinterpret_cast<uint64_t>(extra_script);
+        if (known_scripts_.find(key) == known_scripts_.end() && !eval_script_source(extra_script)) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+bool KorkScriptVMHost::ensure_script_loaded(const KorkScript *script) {
+    if (script == nullptr || vm_ == nullptr) {
+        return false;
+    }
+
+    const uint64_t key = reinterpret_cast<uint64_t>(script);
+    known_scripts_[key] = script;
+
+    if (reload_pending_) {
+        reset_vm();
+        reload_pending_ = false;
+        return reload_known_scripts(script);
+    }
+
+    ScriptLoadState &state = loaded_scripts_[key];
+    if (state.revision == script->get_revision()) {
+        return true;
+    }
+
+    if (state.revision != 0) {
+        reset_vm();
+        return reload_known_scripts(script);
+    }
+
+    return eval_script_source(script);
+}
+
+void KorkScriptVMHost::notify_script_changed(const KorkScript *script) {
+    if (script == nullptr || vm_ == nullptr) {
+        return;
+    }
+
+    known_scripts_[reinterpret_cast<uint64_t>(script)] = script;
+    reload_pending_ = true;
+}
+
+void KorkScriptVMHost::retain_script(const KorkScript *script) {
+    if (script == nullptr) {
+        return;
+    }
+
+    ActiveScriptState &state = active_scripts_[reinterpret_cast<uint64_t>(script)];
+    state.script = script;
+    ++state.ref_count;
+}
+
+void KorkScriptVMHost::release_script(const KorkScript *script) {
+    if (script == nullptr) {
+        return;
+    }
+
+    const uint64_t key = reinterpret_cast<uint64_t>(script);
+    auto found = active_scripts_.find(key);
+    if (found == active_scripts_.end()) {
+        return;
+    }
+
+    if (found->second.ref_count > 1) {
+        --found->second.ref_count;
+        return;
+    }
+
+    active_scripts_.erase(found);
+    loaded_scripts_.erase(key);
+}
+
+KorkApi::NamespaceId KorkScriptVMHost::resolve_object_namespace(Object *owner, const KorkScript *script) {
+    if (vm_ == nullptr || owner == nullptr) {
+        return nullptr;
+    }
+
+    KorkApi::NamespaceId class_ns = ensure_namespace_for_class(owner->get_class());
+    if (script == nullptr || script->get_namespace_name().is_empty()) {
+        return class_ns;
+    }
+
+    const std::string namespace_utf8 = intern_utf8(script->get_namespace_name());
+    KorkApi::NamespaceId script_ns = vm_->findNamespace(vm_->internString(namespace_utf8.c_str()));
+    vm_->linkNamespaceById(class_ns, script_ns);
+    return script_ns;
+}
+
+KorkApi::VMObject *KorkScriptVMHost::create_vm_object_for(Object *owner, const KorkScript *script) {
     if (owner == nullptr || vm_ == nullptr) {
         return nullptr;
     }
 
     const KorkApi::SimObjectId sim_id = ensure_sim_object_id(owner);
     KorkApi::VMObject *vm_object = vm_->createVMObject(godot_object_class_id_, owner);
-    vm_->setObjectNamespace(vm_object, ensure_namespace_for_class(owner->get_class()));
+    vm_->setObjectNamespace(vm_object, resolve_object_namespace(owner, script));
     register_vm_object(owner, vm_object, sim_id);
     return vm_object;
 }
 
-void KorkScriptVMHost::destroy_vm_object_for(Object *owner, KorkApi::VMObject *vm_object) {
+void KorkScriptVMHost::destroy_vm_object_for(Object *owner, const KorkScript *script, KorkApi::VMObject *vm_object) {
     unregister_vm_object(owner, vm_object);
+
     if (vm_ != nullptr && vm_object != nullptr) {
         vm_->decVMRef(vm_object);
     }
@@ -490,8 +625,13 @@ KorkApi::VMObject *KorkScriptVMHost::find_by_path_callback(void *user_ptr, const
         }
     }
 
-    auto found = self->vm_objects_by_name_.find(std::string(path));
-    return found != self->vm_objects_by_name_.end() ? found->second : nullptr;
+    auto by_path = self->vm_objects_by_path_.find(std::string(path));
+    if (by_path != self->vm_objects_by_path_.end()) {
+        return by_path->second;
+    }
+
+    auto by_name = self->vm_objects_by_name_.find(std::string(path));
+    return by_name != self->vm_objects_by_name_.end() ? by_name->second : nullptr;
 }
 
 KorkApi::VMObject *KorkScriptVMHost::find_by_id_callback(void *user_ptr, KorkApi::SimObjectId ident) {
@@ -594,6 +734,11 @@ void KorkScriptVMHost::register_vm_object(Object *owner, KorkApi::VMObject *vm_o
     if (node != nullptr) {
         const CharString name_utf8 = String(node->get_name()).utf8();
         vm_objects_by_name_[std::string(name_utf8.get_data(), static_cast<size_t>(name_utf8.length()))] = vm_object;
+
+        const std::string path_key = make_node_path_key(node);
+        if (!path_key.empty()) {
+            vm_objects_by_path_[path_key] = vm_object;
+        }
     }
 }
 
@@ -614,6 +759,14 @@ void KorkScriptVMHost::unregister_vm_object(Object *owner, KorkApi::VMObject *vm
         auto name_it = vm_objects_by_name_.find(std::string(name_utf8.get_data(), static_cast<size_t>(name_utf8.length())));
         if (name_it != vm_objects_by_name_.end() && name_it->second == vm_object) {
             vm_objects_by_name_.erase(name_it);
+        }
+
+        const std::string path_key = make_node_path_key(node);
+        if (!path_key.empty()) {
+            auto path_it = vm_objects_by_path_.find(path_key);
+            if (path_it != vm_objects_by_path_.end() && path_it->second == vm_object) {
+                vm_objects_by_path_.erase(path_it);
+            }
         }
     }
 }

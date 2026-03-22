@@ -10,18 +10,24 @@
 namespace godot {
 
 static KorkScriptLanguage *language_singleton = nullptr;
+static bool classes_registered = false;
 
 void initialize_korkscript_module(ModuleInitializationLevel p_level) {
     if (p_level != MODULE_INITIALIZATION_LEVEL_SCENE) {
         return;
     }
 
-    ClassDB::register_class<KorkScriptLanguage>();
-    ClassDB::register_class<KorkScript>();
-    ClassDB::register_class<KorkScriptVMNode>();
+    if (!classes_registered) {
+        ClassDB::register_class<KorkScriptLanguage>();
+        ClassDB::register_class<KorkScript>();
+        ClassDB::register_class<KorkScriptVMNode>();
+        classes_registered = true;
+    }
 
-    language_singleton = memnew(KorkScriptLanguage);
-    Engine::get_singleton()->register_script_language(language_singleton);
+    if (language_singleton == nullptr) {
+        language_singleton = memnew(KorkScriptLanguage);
+        Engine::get_singleton()->register_script_language(language_singleton);
+    }
 }
 
 void uninitialize_korkscript_module(ModuleInitializationLevel p_level) {
