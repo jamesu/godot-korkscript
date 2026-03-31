@@ -32,6 +32,7 @@ public:
 
     KorkApi::VMObject *create_vm_object_for(Object *owner, const KorkScript *script);
     void destroy_vm_object_for(Object *owner, const KorkScript *script, KorkApi::VMObject *vm_object);
+    void release_vm_object_for_generation(KorkApi::VMObject *vm_object, uint64_t generation);
 
     bool call_method(KorkApi::VMObject *vm_object, const StringName &method, const Variant **args, GDExtensionInt arg_count, Variant &ret) const;
 
@@ -70,6 +71,7 @@ private:
     KorkApi::NamespaceId resolve_object_namespace(Object *owner, const KorkScript *script);
     void register_vm_object(Object *owner, KorkApi::VMObject *vm_object, KorkApi::SimObjectId sim_id);
     void unregister_vm_object(Object *owner, KorkApi::VMObject *vm_object);
+    KorkApi::Vm *get_vm_for_generation(uint64_t generation) const;
 
     KorkApi::ConsoleValue bridge_object_call(Object *target, int32_t argc, KorkApi::ConsoleValue argv[]) const;
     KorkApi::ConsoleValue bridge_object_get(Object *target, int32_t argc, KorkApi::ConsoleValue argv[]) const;

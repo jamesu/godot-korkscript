@@ -398,6 +398,16 @@ uint64_t KorkScriptVMHost::get_generation() const {
     return generation_;
 }
 
+KorkApi::Vm *KorkScriptVMHost::get_vm_for_generation(uint64_t generation) const {
+    if (generation == generation_) {
+        return vm_;
+    }
+    if (generation == 0 || generation > retired_vms_.size()) {
+        return nullptr;
+    }
+    return retired_vms_[static_cast<size_t>(generation - 1)];
+}
+
 void KorkScriptVMHost::reset_vm() {
     if (vm_ != nullptr) {
         retired_vms_.push_back(vm_);
@@ -553,6 +563,17 @@ void KorkScriptVMHost::destroy_vm_object_for(Object *owner, const KorkScript *sc
 
     if (vm_ != nullptr && vm_object != nullptr) {
         vm_->decVMRef(vm_object);
+    }
+}
+
+void KorkScriptVMHost::release_vm_object_for_generation(KorkApi::VMObject *vm_object, uint64_t generation) {
+    if (vm_object == nullptr) {
+        return;
+    }
+
+    KorkApi::Vm *vm = get_vm_for_generation(generation);
+    if (vm != nullptr) {
+        vm->decVMRef(vm_object);
     }
 }
 

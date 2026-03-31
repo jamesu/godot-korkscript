@@ -37,6 +37,9 @@ bool sync_instance_vm_object(KorkScriptInstance *instance) {
         return true;
     }
 
+    if (instance->vm_object != nullptr) {
+        instance->host->release_vm_object_for_generation(instance->vm_object, instance->host_generation);
+    }
     instance->vm_object = nullptr;
     instance->vm_object = instance->host->create_vm_object_for(instance->owner, instance->script.ptr());
     instance->host_generation = generation;
