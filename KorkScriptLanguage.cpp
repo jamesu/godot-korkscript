@@ -6,9 +6,95 @@
 #include <godot_cpp/core/class_db.hpp>
 #include <godot_cpp/core/memory.hpp>
 
+#include <vector>
+
 namespace godot {
 
 KorkScriptLanguage *KorkScriptLanguage::singleton_ = nullptr;
+
+namespace {
+
+String normalize_function_name(const String &p_function) {
+    String normalized_name = p_function.strip_edges();
+    if (normalized_name.is_empty()) {
+        return String();
+    }
+
+    const int brace_pos = normalized_name.find("{");
+    if (brace_pos >= 0) {
+        normalized_name = normalized_name.substr(0, brace_pos).strip_edges();
+    }
+    const int paren_pos = normalized_name.find("(");
+    if (paren_pos >= 0) {
+        normalized_name = normalized_name.substr(0, paren_pos).strip_edges();
+    }
+    const int ns_lookup_pos = normalized_name.rfind("::");
+    if (ns_lookup_pos >= 0) {
+        normalized_name = normalized_name.substr(ns_lookup_pos + 2).strip_edges();
+    }
+
+    return normalized_name;
+}
+
+struct FunctionEntry {
+    String name;
+    int32_t line = -1;
+};
+
+std::vector<FunctionEntry> scan_function_entries(const String &code) {
+    std::vector<FunctionEntry> out;
+
+    int from = 0;
+    while (true) {
+        const int function_pos = code.find("function ", from);
+        if (function_pos < 0) {
+            break;
+        }
+
+        const int ns_pos = code.find("::", function_pos);
+        const int open_paren = code.find("(", function_pos);
+        if (ns_pos > function_pos && open_paren > ns_pos) {
+            const String method_name = code.substr(ns_pos + 2, open_paren - (ns_pos + 2)).strip_edges();
+            if (!method_name.is_empty()) {
+                FunctionEntry entry;
+                entry.name = method_name;
+                entry.line = 1 + code.count("\n", 0, function_pos);
+                out.push_back(entry);
+            }
+        }
+
+        from = function_pos + 8;
+    }
+
+    return out;
+}
+
+int32_t find_function_line(const String &p_function, const String &p_code) {
+    const String normalized_name = normalize_function_name(p_function);
+    if (normalized_name.is_empty()) {
+        return -1;
+    }
+
+    const std::vector<FunctionEntry> functions = scan_function_entries(p_code);
+    for (const FunctionEntry &entry : functions) {
+        if (entry.name == normalized_name) {
+            return entry.line;
+        }
+    }
+
+    return -1;
+}
+
+PackedStringArray scan_functions(const String &code) {
+    PackedStringArray out;
+    const std::vector<FunctionEntry> functions = scan_function_entries(code);
+    for (const FunctionEntry &entry : functions) {
+        out.push_back(vformat("%s:%d", entry.name, entry.line));
+    }
+    return out;
+}
+
+} // namespace
 
 KorkScriptLanguage::KorkScriptLanguage() {
     singleton_ = this;
@@ -105,17 +191,36 @@ Ref<Script> KorkScriptLanguage::_make_template(const String &, const String &, c
 }
 
 bool KorkScriptLanguage::_is_using_templates() {
-    return false;
+    return true;
 }
 
-Dictionary KorkScriptLanguage::_validate(const String &, const String &, bool, bool, bool, bool) const {
+Dictionary KorkScriptLanguage::_validate(const String &p_script, const String &, bool p_validate_functions, bool, bool, bool) const {
     Dictionary result;
     result["valid"] = true;
+    result["errors"] = TypedArray<Dictionary>();
+    result["warnings"] = TypedArray<Dictionary>();
+    result["safe_lines"] = PackedInt32Array();
+    result["functions"] = p_validate_functions ? Variant(scan_functions(p_script)) : Variant(PackedStringArray());
     return result;
 }
 
 String KorkScriptLanguage::_validate_path(const String &p_path) const {
-    return p_path;
+    String path = p_path.strip_edges();
+    if (path.is_empty()) {
+        return "res://new_korkscript.ks";
+    }
+
+    if (!path.begins_with("res://") && !path.begins_with("user://")) {
+        path = "res://" + path;
+    }
+
+    const String lower_path = path.to_lower();
+    if (!lower_path.ends_with(".ks") && !lower_path.ends_with(".tscript")) {
+        const String extension = "." + _get_extension();
+        path += extension;
+    }
+
+    return path;
 }
 
 Object *KorkScriptLanguage::_create_script() const {
@@ -132,6 +237,10 @@ bool KorkScriptLanguage::_supports_documentation() const {
 
 bool KorkScriptLanguage::_can_inherit_from_file() const {
     return false;
+}
+
+int32_t KorkScriptLanguage::_find_function(const String &p_function, const String &p_code) const {
+    return find_function_line(p_function, p_code);
 }
 
 bool KorkScriptLanguage::_can_make_function() const {
@@ -163,6 +272,10 @@ Dictionary KorkScriptLanguage::_lookup_code(const String &, const String &, cons
     return result;
 }
 
+ScriptLanguage::ScriptNameCasing KorkScriptLanguage::_preferred_file_name_casing() const {
+    return SCRIPT_NAME_CASING_AUTO;
+}
+
 void KorkScriptLanguage::_thread_enter() {
 }
 
@@ -176,6 +289,7 @@ TypedArray<Dictionary> KorkScriptLanguage::_debug_get_current_stack_info() {
 PackedStringArray KorkScriptLanguage::_get_recognized_extensions() const {
     PackedStringArray out;
     out.push_back("ks");
+    out.push_back("tscript");
     return out;
 }
 

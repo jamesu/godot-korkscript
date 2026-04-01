@@ -38,11 +38,13 @@ public:
     bool _supports_builtin_mode() const override;
     bool _supports_documentation() const override;
     bool _can_inherit_from_file() const override;
+    int32_t _find_function(const String &p_function, const String &p_code) const override;
     bool _can_make_function() const override;
     Error _open_in_external_editor(const Ref<Script> &p_script, int32_t p_line, int32_t p_column) override;
     bool _overrides_external_editor() override;
     Dictionary _complete_code(const String &p_code, const String &p_path, Object *p_owner) const override;
     Dictionary _lookup_code(const String &p_code, const String &p_symbol, const String &p_path, Object *p_owner) const override;
+    ScriptNameCasing _preferred_file_name_casing() const override;
     void _thread_enter() override;
     void _thread_exit() override;
     TypedArray<Dictionary> _debug_get_current_stack_info() override;

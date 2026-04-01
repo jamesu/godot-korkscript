@@ -253,11 +253,111 @@ std::string string_name_key(const StringName &name) {
     return std::string(utf8.get_data(), static_cast<size_t>(utf8.length()));
 }
 
+Variant::Type variant_type_from_name(const String &type_name) {
+    const String normalized = type_name.strip_edges();
+    if (normalized.is_empty()) {
+        return Variant::NIL;
+    }
+    if (normalized == "bool" || normalized == "Bool") {
+        return Variant::BOOL;
+    }
+    if (normalized == "int" || normalized == "Int") {
+        return Variant::INT;
+    }
+    if (normalized == "float" || normalized == "Float") {
+        return Variant::FLOAT;
+    }
+    if (normalized == "String" || normalized == "string") {
+        return Variant::STRING;
+    }
+    if (normalized == "Vector2") {
+        return Variant::VECTOR2;
+    }
+    if (normalized == "Vector3") {
+        return Variant::VECTOR3;
+    }
+    if (normalized == "Vector4") {
+        return Variant::VECTOR4;
+    }
+    if (normalized == "Color") {
+        return Variant::COLOR;
+    }
+    return Variant::NIL;
+}
+
+int32_t find_method_line_in_code(const String &code, const String &method_name) {
+    String normalized_name = method_name.strip_edges();
+    if (normalized_name.is_empty()) {
+        return -1;
+    }
+
+    const int brace_pos = normalized_name.find("{");
+    if (brace_pos >= 0) {
+        normalized_name = normalized_name.substr(0, brace_pos).strip_edges();
+    }
+    const int paren_pos = normalized_name.find("(");
+    if (paren_pos >= 0) {
+        normalized_name = normalized_name.substr(0, paren_pos).strip_edges();
+    }
+    const int ns_lookup_pos = normalized_name.rfind("::");
+    if (ns_lookup_pos >= 0) {
+        normalized_name = normalized_name.substr(ns_lookup_pos + 2).strip_edges();
+    }
+
+    int from = 0;
+    while (true) {
+        const int function_pos = code.find("function ", from);
+        if (function_pos < 0) {
+            break;
+        }
+
+        const int ns_pos = code.find("::", function_pos);
+        const int open_paren = code.find("(", function_pos);
+        if (ns_pos > function_pos && open_paren > ns_pos) {
+            const String candidate_name = code.substr(ns_pos + 2, open_paren - (ns_pos + 2)).strip_edges();
+            if (candidate_name == normalized_name) {
+                return 1 + code.count("\n", 0, function_pos);
+            }
+        }
+
+        from = function_pos + 8;
+    }
+
+    return -1;
+}
+
+KorkScript::MethodArgumentMetadata parse_method_argument(const String &argument_text) {
+    KorkScript::MethodArgumentMetadata metadata;
+    String token = argument_text.strip_edges();
+    if (token.is_empty()) {
+        return metadata;
+    }
+
+    const int colon_pos = token.find(":");
+    String name_part = colon_pos >= 0 ? token.substr(0, colon_pos) : token;
+    String type_part = colon_pos >= 0 ? token.substr(colon_pos + 1) : String();
+
+    name_part = name_part.strip_edges();
+    if (name_part.begins_with("%")) {
+        name_part = name_part.substr(1);
+    }
+    metadata.name = StringName(name_part);
+
+    type_part = type_part.strip_edges();
+    metadata.type = variant_type_from_name(type_part);
+    if (metadata.type == Variant::NIL && !type_part.is_empty()) {
+        metadata.class_name = StringName(type_part);
+    }
+
+    return metadata;
+}
+
 } // namespace
 
 KorkScript::KorkScript() :
         vm_name_("default"),
         namespace_name_(""),
+        inferred_namespace_name_(""),
         base_type_("Node"),
         revision_(1) {
 }
@@ -303,6 +403,16 @@ const String &KorkScript::get_base_type() const {
     return base_type_;
 }
 
+String KorkScript::get_effective_namespace_name() const {
+    if (!namespace_name_.is_empty()) {
+        return namespace_name_;
+    }
+    if (!inferred_namespace_name_.is_empty()) {
+        return inferred_namespace_name_;
+    }
+    return base_type_;
+}
+
 uint64_t KorkScript::get_revision() const {
     return revision_;
 }
@@ -324,7 +434,8 @@ Ref<Script> KorkScript::_get_base_script() const {
 }
 
 StringName KorkScript::_get_global_name() const {
-    return StringName();
+    const String effective_namespace = get_effective_namespace_name();
+    return effective_namespace.is_empty() ? StringName() : StringName(effective_namespace);
 }
 
 StringName KorkScript::_get_instance_base_type() const {
@@ -396,10 +507,25 @@ bool KorkScript::_has_static_method(const StringName &) const {
 }
 
 Variant KorkScript::_get_script_method_argument_count(const StringName &p_method) const {
-    if (!has_method_name(p_method)) {
+    const MethodMetadata *metadata = get_method_metadata(p_method);
+    if (metadata == nullptr) {
         return Variant();
     }
-    return 0;
+    return static_cast<int64_t>(metadata->arguments.size());
+}
+
+Dictionary KorkScript::_get_method_info(const StringName &p_method) const {
+    const MethodMetadata *metadata = get_method_metadata(p_method);
+    if (metadata == nullptr) {
+        return Dictionary();
+    }
+
+    MethodInfo method_info(p_method);
+    for (const MethodArgumentMetadata &argument : metadata->arguments) {
+        PropertyInfo property_info(argument.type, String(argument.name), PROPERTY_HINT_NONE, String(argument.class_name));
+        method_info.arguments.push_back(property_info);
+    }
+    return method_info.operator Dictionary();
 }
 
 bool KorkScript::_is_tool() const {
@@ -439,14 +565,30 @@ void KorkScript::_update_exports() {
 
 TypedArray<Dictionary> KorkScript::_get_script_method_list() const {
     TypedArray<Dictionary> out;
-    for (const std::string &name : method_names_) {
-        out.push_back(MethodInfo(StringName(name.c_str())).operator Dictionary());
+    for (const auto &entry : method_metadata_) {
+        out.push_back(_get_method_info(StringName(entry.first.c_str())));
     }
     return out;
 }
 
 TypedArray<Dictionary> KorkScript::_get_script_property_list() const {
     return TypedArray<Dictionary>();
+}
+
+int32_t KorkScript::_get_member_line(const StringName &p_member) const {
+    const MethodMetadata *metadata = get_method_metadata(p_member);
+    if (metadata != nullptr && metadata->line > 0) {
+        return metadata->line;
+    }
+    return find_method_line_in_code(source_code_, String(p_member));
+}
+
+TypedArray<StringName> KorkScript::_get_members() const {
+    TypedArray<StringName> out;
+    for (const auto &entry : method_metadata_) {
+        out.push_back(StringName(entry.first.c_str()));
+    }
+    return out;
 }
 
 void KorkScript::_bind_methods() {
@@ -466,6 +608,8 @@ void KorkScript::_bind_methods() {
 
 void KorkScript::refresh_method_cache() {
     method_names_.clear();
+    method_metadata_.clear();
+    inferred_namespace_name_ = String();
 
     int from = 0;
     while (true) {
@@ -476,15 +620,42 @@ void KorkScript::refresh_method_cache() {
 
         const int ns_pos = source_code_.find("::", function_pos);
         const int open_paren = source_code_.find("(", function_pos);
-        if (ns_pos > function_pos && open_paren > ns_pos) {
+        const int close_paren = open_paren >= 0 ? source_code_.find(")", open_paren) : -1;
+        if (ns_pos > function_pos && open_paren > ns_pos && close_paren > open_paren) {
+            const String namespace_name = source_code_.substr(function_pos + 9, ns_pos - (function_pos + 9)).strip_edges();
             const String method_name = source_code_.substr(ns_pos + 2, open_paren - (ns_pos + 2)).strip_edges();
             if (!method_name.is_empty()) {
-                method_names_.insert(string_name_key(StringName(method_name)));
+                const std::string method_key = string_name_key(StringName(method_name));
+                method_names_.insert(method_key);
+                if (inferred_namespace_name_.is_empty() && !namespace_name.is_empty()) {
+                    inferred_namespace_name_ = namespace_name;
+                }
+
+                MethodMetadata metadata;
+                const String arguments_text = source_code_.substr(open_paren + 1, close_paren - (open_paren + 1));
+                PackedStringArray arguments = arguments_text.split(",");
+                for (int i = 0; i < arguments.size(); ++i) {
+                    MethodArgumentMetadata argument_metadata = parse_method_argument(arguments[i]);
+                    if (argument_metadata.name.is_empty()) {
+                        continue;
+                    }
+                    if (metadata.arguments.empty() && argument_metadata.name == StringName("this")) {
+                        continue;
+                    }
+                    metadata.arguments.push_back(argument_metadata);
+                }
+                metadata.line = 1 + source_code_.count("\n", 0, function_pos);
+                method_metadata_[method_key] = metadata;
             }
         }
 
         from = function_pos + 8;
     }
+}
+
+const KorkScript::MethodMetadata *KorkScript::get_method_metadata(const StringName &method) const {
+    const auto found = method_metadata_.find(string_name_key(method));
+    return found != method_metadata_.end() ? &found->second : nullptr;
 }
 
 } // namespace godot

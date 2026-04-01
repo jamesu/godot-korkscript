@@ -3,7 +3,9 @@
 #include <godot_cpp/classes/script_language.hpp>
 #include <godot_cpp/classes/script_extension.hpp>
 
+#include <unordered_map>
 #include <unordered_set>
+#include <vector>
 
 namespace godot {
 
@@ -24,6 +26,7 @@ public:
     const String &get_vm_name() const;
     const String &get_namespace_name() const;
     const String &get_base_type() const;
+    String get_effective_namespace_name() const;
     uint64_t get_revision() const;
     bool has_method_name(const StringName &method) const;
 
@@ -43,6 +46,7 @@ public:
     bool _has_method(const StringName &p_method) const override;
     bool _has_static_method(const StringName &p_method) const override;
     Variant _get_script_method_argument_count(const StringName &p_method) const override;
+    Dictionary _get_method_info(const StringName &p_method) const override;
     bool _is_tool() const override;
     bool _is_valid() const override;
     bool _is_abstract() const override;
@@ -54,19 +58,36 @@ public:
     void _update_exports() override;
     TypedArray<Dictionary> _get_script_method_list() const override;
     TypedArray<Dictionary> _get_script_property_list() const override;
+    int32_t _get_member_line(const StringName &p_member) const override;
+    TypedArray<StringName> _get_members() const override;
 
 protected:
     static void _bind_methods();
 
+public:
+    struct MethodArgumentMetadata {
+        StringName name;
+        Variant::Type type = Variant::NIL;
+        StringName class_name;
+    };
+
+    struct MethodMetadata {
+        std::vector<MethodArgumentMetadata> arguments;
+        int32_t line = -1;
+    };
+
 private:
     void refresh_method_cache();
+    const MethodMetadata *get_method_metadata(const StringName &method) const;
 
     String source_code_;
     String vm_name_;
     String namespace_name_;
+    String inferred_namespace_name_;
     String base_type_;
     uint64_t revision_;
     std::unordered_set<std::string> method_names_;
+    std::unordered_map<std::string, MethodMetadata> method_metadata_;
 };
 
 } // namespace godot

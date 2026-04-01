@@ -41,6 +41,7 @@ endforeach()
 add_library(korkscript_godot SHARED
   KorkScript.cpp
   KorkScriptLanguage.cpp
+  KorkScriptResourceFormat.cpp
   KorkScriptVMNode.cpp
   KorkScriptVMHost.cpp
   gdextension_entry.cpp

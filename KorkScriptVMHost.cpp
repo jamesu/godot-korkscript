@@ -536,11 +536,16 @@ KorkApi::NamespaceId KorkScriptVMHost::resolve_object_namespace(Object *owner, c
     }
 
     KorkApi::NamespaceId class_ns = ensure_namespace_for_class(owner->get_class());
-    if (script == nullptr || script->get_namespace_name().is_empty()) {
+    if (script == nullptr) {
         return class_ns;
     }
 
-    const std::string namespace_utf8 = intern_utf8(script->get_namespace_name());
+    const String script_namespace_name = script->get_effective_namespace_name();
+    if (script_namespace_name.is_empty()) {
+        return class_ns;
+    }
+
+    const std::string namespace_utf8 = intern_utf8(script_namespace_name);
     KorkApi::NamespaceId script_ns = vm_->findNamespace(vm_->internString(namespace_utf8.c_str()));
     vm_->linkNamespaceById(class_ns, script_ns);
     return script_ns;
