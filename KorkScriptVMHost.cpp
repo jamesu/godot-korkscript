@@ -4,8 +4,12 @@
 
 #include <godot_cpp/classes/class_db_singleton.hpp>
 #include <godot_cpp/classes/node.hpp>
+#include <godot_cpp/classes/object.hpp>
+#include <godot_cpp/classes/scene_tree.hpp>
+#include <godot_cpp/classes/window.hpp>
 #include <godot_cpp/core/class_db.hpp>
 #include <godot_cpp/variant/array.hpp>
+#include <godot_cpp/variant/dictionary.hpp>
 #include <godot_cpp/variant/string_name.hpp>
 #include <godot_cpp/variant/utility_functions.hpp>
 #include <godot_cpp/variant/color.hpp>
@@ -16,6 +20,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <unordered_set>
 
 namespace godot {
 
@@ -33,6 +38,19 @@ std::string make_node_path_key(Node *node) {
 
     const CharString utf8 = String(node->get_path()).utf8();
     return std::string(utf8.get_data(), static_cast<size_t>(utf8.length()));
+}
+
+bool is_numeric_lookup(const String &value) {
+    if (value.is_empty()) {
+        return false;
+    }
+    for (int i = 0; i < value.length(); ++i) {
+        const char32_t c = value[i];
+        if (c < '0' || c > '9') {
+            return false;
+        }
+    }
+    return true;
 }
 
 String format_component(double value) {
@@ -414,6 +432,7 @@ void KorkScriptVMHost::reset_vm() {
         vm_ = nullptr;
     }
 
+    vm_objects_by_owner_id_.clear();
     vm_objects_by_id_.clear();
     vm_objects_by_name_.clear();
     vm_objects_by_path_.clear();
@@ -551,21 +570,133 @@ KorkApi::NamespaceId KorkScriptVMHost::resolve_object_namespace(Object *owner, c
     return script_ns;
 }
 
-KorkApi::VMObject *KorkScriptVMHost::create_vm_object_for(Object *owner, const KorkScript *script) {
+const KorkScript *KorkScriptVMHost::get_attached_korkscript(Object *owner) const {
+    if (owner == nullptr || !owner->has_method(StringName("get_script"))) {
+        return nullptr;
+    }
+
+    const Variant script_value = owner->call(StringName("get_script"));
+    if (script_value.get_type() != Variant::OBJECT) {
+        return nullptr;
+    }
+
+    Ref<KorkScript> script = script_value;
+    return script.is_valid() ? script.ptr() : nullptr;
+}
+
+String KorkScriptVMHost::get_object_name(Object *owner) const {
+    if (owner == nullptr) {
+        return String();
+    }
+
+    Node *node = Object::cast_to<Node>(owner);
+    if (node != nullptr) {
+        return String(node->get_name());
+    }
+
+    return vformat("%s_%d", owner->get_class(), static_cast<int64_t>(ensure_sim_object_id(owner)));
+}
+
+Object *KorkScriptVMHost::resolve_object_reference(Object *context_owner, const String &query) const {
+    String trimmed = query.strip_edges();
+    if (trimmed.is_empty()) {
+        return nullptr;
+    }
+
+    if (trimmed == "." || trimmed == "self") {
+        return context_owner;
+    }
+
+    if (is_numeric_lookup(trimmed)) {
+        const KorkApi::SimObjectId sim_id = static_cast<KorkApi::SimObjectId>(trimmed.to_int());
+        auto found = vm_objects_by_id_.find(sim_id);
+        if (found != vm_objects_by_id_.end() && found->second != nullptr) {
+            return static_cast<Object *>(found->second->userPtr);
+        }
+
+        return UtilityFunctions::instance_from_id(trimmed.to_int());
+    }
+
+    Node *context_node = Object::cast_to<Node>(context_owner);
+    if (context_node != nullptr) {
+        Node *relative = context_node->get_node_or_null(NodePath(trimmed));
+        if (relative != nullptr) {
+            return relative;
+        }
+
+        if (trimmed.find("/") < 0) {
+            Node *descendant = context_node->find_child(trimmed, true, false);
+            if (descendant != nullptr) {
+                return descendant;
+            }
+        }
+    }
+
+    SceneTree *tree = context_node != nullptr ? context_node->get_tree() : nullptr;
+    Window *root = tree != nullptr ? tree->get_root() : nullptr;
+    if (root == nullptr && !vm_objects_by_owner_id_.empty()) {
+        for (const auto &entry : vm_objects_by_owner_id_) {
+            Object *candidate_owner = entry.second != nullptr ? static_cast<Object *>(entry.second->userPtr) : nullptr;
+            Node *candidate_node = Object::cast_to<Node>(candidate_owner);
+            if (candidate_node != nullptr && candidate_node->get_tree() != nullptr) {
+                root = candidate_node->get_tree()->get_root();
+                break;
+            }
+        }
+    }
+
+    if (root != nullptr) {
+        Node *absolute = nullptr;
+        if (trimmed.begins_with("/")) {
+            absolute = root->get_node_or_null(NodePath(trimmed));
+        } else {
+            absolute = root->get_node_or_null(NodePath(trimmed));
+            if (absolute == nullptr) {
+                absolute = root->find_child(trimmed, true, false);
+            }
+        }
+
+        if (absolute != nullptr) {
+            return absolute;
+        }
+    }
+
+    auto by_name = vm_objects_by_name_.find(intern_utf8(trimmed));
+    if (by_name != vm_objects_by_name_.end() && by_name->second != nullptr) {
+        return static_cast<Object *>(by_name->second->userPtr);
+    }
+
+    return nullptr;
+}
+
+KorkApi::VMObject *KorkScriptVMHost::get_or_create_vm_object(Object *owner, const KorkScript *script) {
     if (owner == nullptr || vm_ == nullptr) {
         return nullptr;
     }
 
+    const uint64_t owner_id = owner->get_instance_id();
+    auto found = vm_objects_by_owner_id_.find(owner_id);
+    if (found != vm_objects_by_owner_id_.end() && found->second != nullptr) {
+        vm_->setObjectNamespace(found->second, resolve_object_namespace(owner, script != nullptr ? script : get_attached_korkscript(owner)));
+        return found->second;
+    }
+
     const KorkApi::SimObjectId sim_id = ensure_sim_object_id(owner);
     KorkApi::VMObject *vm_object = vm_->createVMObject(godot_object_class_id_, owner);
-    vm_->setObjectNamespace(vm_object, resolve_object_namespace(owner, script));
+    vm_->setObjectNamespace(vm_object, resolve_object_namespace(owner, script != nullptr ? script : get_attached_korkscript(owner)));
     register_vm_object(owner, vm_object, sim_id);
     return vm_object;
 }
 
-void KorkScriptVMHost::destroy_vm_object_for(Object *owner, const KorkScript *script, KorkApi::VMObject *vm_object) {
-    unregister_vm_object(owner, vm_object);
+KorkApi::VMObject *KorkScriptVMHost::create_vm_object_for(Object *owner, const KorkScript *script) {
+    KorkApi::VMObject *vm_object = get_or_create_vm_object(owner, script);
+    if (vm_ != nullptr && vm_object != nullptr) {
+        vm_->incVMRef(vm_object);
+    }
+    return vm_object;
+}
 
+void KorkScriptVMHost::destroy_vm_object_for(Object *owner, const KorkScript *script, KorkApi::VMObject *vm_object) {
     if (vm_ != nullptr && vm_object != nullptr) {
         vm_->decVMRef(vm_object);
     }
@@ -626,14 +757,20 @@ void KorkScriptVMHost::log_callback(uint32_t level, const char *console_line, vo
     UtilityFunctions::print(vformat("[korkscript:%s:%d] %s", self->vm_name_, static_cast<int64_t>(level), String(console_line ? console_line : "")));
 }
 
-KorkApi::VMObject *KorkScriptVMHost::find_by_name_callback(void *user_ptr, StringTableEntry name, KorkApi::VMObject *) {
+KorkApi::VMObject *KorkScriptVMHost::find_by_name_callback(void *user_ptr, StringTableEntry name, KorkApi::VMObject *parent) {
     KorkScriptVMHost *self = static_cast<KorkScriptVMHost *>(user_ptr);
     if (self == nullptr || name == nullptr) {
         return nullptr;
     }
 
     auto found = self->vm_objects_by_name_.find(std::string(name));
-    return found != self->vm_objects_by_name_.end() ? found->second : nullptr;
+    if (found != self->vm_objects_by_name_.end()) {
+        return found->second;
+    }
+
+    Object *context_owner = parent != nullptr ? static_cast<Object *>(parent->userPtr) : nullptr;
+    Object *owner = self->resolve_object_reference(context_owner, String(name));
+    return self->get_or_create_vm_object(owner, nullptr);
 }
 
 KorkApi::VMObject *KorkScriptVMHost::find_by_path_callback(void *user_ptr, const char *path) {
@@ -657,7 +794,12 @@ KorkApi::VMObject *KorkScriptVMHost::find_by_path_callback(void *user_ptr, const
     }
 
     auto by_name = self->vm_objects_by_name_.find(std::string(path));
-    return by_name != self->vm_objects_by_name_.end() ? by_name->second : nullptr;
+    if (by_name != self->vm_objects_by_name_.end()) {
+        return by_name->second;
+    }
+
+    Object *owner = self->resolve_object_reference(nullptr, String(path));
+    return self->get_or_create_vm_object(owner, nullptr);
 }
 
 KorkApi::VMObject *KorkScriptVMHost::find_by_id_callback(void *user_ptr, KorkApi::SimObjectId ident) {
@@ -667,7 +809,12 @@ KorkApi::VMObject *KorkScriptVMHost::find_by_id_callback(void *user_ptr, KorkApi
     }
 
     auto found = self->vm_objects_by_id_.find(ident);
-    return found != self->vm_objects_by_id_.end() ? found->second : nullptr;
+    if (found != self->vm_objects_by_id_.end()) {
+        return found->second;
+    }
+
+    Object *owner = self->resolve_object_reference(nullptr, String::num_int64(ident));
+    return self->get_or_create_vm_object(owner, nullptr);
 }
 
 KorkApi::SimObjectId KorkScriptVMHost::get_vm_object_id(KorkApi::VMObject *object) {
@@ -687,14 +834,7 @@ StringTableEntry KorkScriptVMHost::get_vm_object_name(KorkApi::VMObject *object)
 
     KorkScriptVMHost *self = static_cast<KorkScriptVMHost *>(object->klass->userPtr);
     Object *owner = static_cast<Object *>(object->userPtr);
-    Node *node = Object::cast_to<Node>(owner);
-    if (node != nullptr) {
-        const CharString utf8 = String(node->get_name()).utf8();
-        return self->vm_->internString(utf8.get_data());
-    }
-
-    const String generated_name = vformat("%s_%d", owner->get_class(), static_cast<int64_t>(self->ensure_sim_object_id(owner)));
-    const CharString utf8 = generated_name.utf8();
+    const CharString utf8 = self->get_object_name(owner).utf8();
     return self->vm_->internString(utf8.get_data());
 }
 
@@ -712,6 +852,34 @@ KorkApi::ConsoleValue KorkScriptVMHost::object_set_callback(void *obj, void *use
 
 KorkApi::ConsoleValue KorkScriptVMHost::object_print_callback(void *obj, void *user_ptr, int32_t argc, KorkApi::ConsoleValue argv[]) {
     return static_cast<KorkScriptVMHost *>(user_ptr)->bridge_object_print(static_cast<Object *>(obj), argc, argv);
+}
+
+KorkApi::ConsoleValue KorkScriptVMHost::object_get_id_callback(void *obj, void *user_ptr, int32_t argc, KorkApi::ConsoleValue argv[]) {
+    return static_cast<KorkScriptVMHost *>(user_ptr)->bridge_object_get_id(static_cast<Object *>(obj), argc, argv);
+}
+
+KorkApi::ConsoleValue KorkScriptVMHost::object_get_name_callback(void *obj, void *user_ptr, int32_t argc, KorkApi::ConsoleValue argv[]) {
+    return static_cast<KorkScriptVMHost *>(user_ptr)->bridge_object_get_name(static_cast<Object *>(obj), argc, argv);
+}
+
+KorkApi::ConsoleValue KorkScriptVMHost::object_dump_callback(void *obj, void *user_ptr, int32_t argc, KorkApi::ConsoleValue argv[]) {
+    return static_cast<KorkScriptVMHost *>(user_ptr)->bridge_object_dump(static_cast<Object *>(obj), argc, argv);
+}
+
+KorkApi::ConsoleValue KorkScriptVMHost::object_find_object_callback(void *obj, void *user_ptr, int32_t argc, KorkApi::ConsoleValue argv[]) {
+    return static_cast<KorkScriptVMHost *>(user_ptr)->bridge_object_find_object(static_cast<Object *>(obj), argc, argv);
+}
+
+KorkApi::ConsoleValue KorkScriptVMHost::object_get_parent_callback(void *obj, void *user_ptr, int32_t argc, KorkApi::ConsoleValue argv[]) {
+    return static_cast<KorkScriptVMHost *>(user_ptr)->bridge_object_get_parent(static_cast<Object *>(obj), argc, argv);
+}
+
+KorkApi::ConsoleValue KorkScriptVMHost::object_get_object_callback(void *obj, void *user_ptr, int32_t argc, KorkApi::ConsoleValue argv[]) {
+    return static_cast<KorkScriptVMHost *>(user_ptr)->bridge_object_get_object(static_cast<Object *>(obj), argc, argv);
+}
+
+KorkApi::ConsoleValue KorkScriptVMHost::object_get_count_callback(void *obj, void *user_ptr, int32_t argc, KorkApi::ConsoleValue argv[]) {
+    return static_cast<KorkScriptVMHost *>(user_ptr)->bridge_object_get_count(static_cast<Object *>(obj), argc, argv);
 }
 
 KorkApi::NamespaceId KorkScriptVMHost::ensure_namespace_for_class(const StringName &class_name) {
@@ -736,9 +904,16 @@ void KorkScriptVMHost::ensure_object_bridge_namespace() {
     vm_->addNamespaceFunction(object_ns, vm_->internString("get"), &KorkScriptVMHost::object_get_callback, this, "(property)", 3, 3);
     vm_->addNamespaceFunction(object_ns, vm_->internString("set"), &KorkScriptVMHost::object_set_callback, this, "(property, value)", 4, 4);
     vm_->addNamespaceFunction(object_ns, vm_->internString("print"), &KorkScriptVMHost::object_print_callback, this, "(...args)", 2, KorkApi::Constants::MaxArgs);
+    vm_->addNamespaceFunction(object_ns, vm_->internString("getId"), &KorkScriptVMHost::object_get_id_callback, this, "()", 2, 2);
+    vm_->addNamespaceFunction(object_ns, vm_->internString("getName"), &KorkScriptVMHost::object_get_name_callback, this, "()", 2, 2);
+    vm_->addNamespaceFunction(object_ns, vm_->internString("dump"), &KorkScriptVMHost::object_dump_callback, this, "()", 2, 2);
+    vm_->addNamespaceFunction(object_ns, vm_->internString("findObject"), &KorkScriptVMHost::object_find_object_callback, this, "(path)", 3, 3);
+    vm_->addNamespaceFunction(object_ns, vm_->internString("getParent"), &KorkScriptVMHost::object_get_parent_callback, this, "()", 2, 2);
+    vm_->addNamespaceFunction(object_ns, vm_->internString("getObject"), &KorkScriptVMHost::object_get_object_callback, this, "(index)", 3, 3);
+    vm_->addNamespaceFunction(object_ns, vm_->internString("getCount"), &KorkScriptVMHost::object_get_count_callback, this, "()", 2, 2);
 }
 
-KorkApi::SimObjectId KorkScriptVMHost::ensure_sim_object_id(Object *owner) {
+KorkApi::SimObjectId KorkScriptVMHost::ensure_sim_object_id(Object *owner) const {
     const uint64_t key = owner->get_instance_id();
     auto found = sim_ids_.find(key);
     if (found != sim_ids_.end()) {
@@ -754,6 +929,7 @@ void KorkScriptVMHost::register_vm_object(Object *owner, KorkApi::VMObject *vm_o
         return;
     }
 
+    vm_objects_by_owner_id_[owner->get_instance_id()] = vm_object;
     vm_objects_by_id_[sim_id] = vm_object;
 
     Node *node = Object::cast_to<Node>(owner);
@@ -771,6 +947,11 @@ void KorkScriptVMHost::register_vm_object(Object *owner, KorkApi::VMObject *vm_o
 void KorkScriptVMHost::unregister_vm_object(Object *owner, KorkApi::VMObject *vm_object) {
     if (owner == nullptr) {
         return;
+    }
+
+    auto owner_it = vm_objects_by_owner_id_.find(owner->get_instance_id());
+    if (owner_it != vm_objects_by_owner_id_.end() && owner_it->second == vm_object) {
+        vm_objects_by_owner_id_.erase(owner_it);
     }
 
     auto sim_it = sim_ids_.find(owner->get_instance_id());
@@ -843,6 +1024,159 @@ KorkApi::ConsoleValue KorkScriptVMHost::bridge_object_print(Object *, int32_t ar
     }
     UtilityFunctions::print(String(" ").join(parts));
     return KorkApi::ConsoleValue::makeString("");
+}
+
+KorkApi::ConsoleValue KorkScriptVMHost::bridge_object_get_id(Object *target, int32_t argc, KorkApi::ConsoleValue argv[]) const {
+    if (target == nullptr || argc != 2) {
+        return KorkApi::ConsoleValue::makeUnsigned(0);
+    }
+    return KorkApi::ConsoleValue::makeUnsigned(ensure_sim_object_id(target));
+}
+
+KorkApi::ConsoleValue KorkScriptVMHost::bridge_object_get_name(Object *target, int32_t argc, KorkApi::ConsoleValue argv[]) const {
+    if (target == nullptr || argc != 2) {
+        return KorkApi::ConsoleValue::makeString("");
+    }
+
+    const CharString utf8 = get_object_name(target).utf8();
+    KorkApi::ConsoleValue buffer = vm_->getStringInZone(KorkApi::ConsoleValue::ZoneReturn, static_cast<uint32_t>(utf8.length() + 1));
+    char *out = static_cast<char *>(buffer.evaluatePtr(vm_->getAllocBase()));
+    if (out != nullptr) {
+        std::memcpy(out, utf8.get_data(), static_cast<size_t>(utf8.length() + 1));
+    }
+    return buffer;
+}
+
+KorkApi::ConsoleValue KorkScriptVMHost::bridge_object_dump(Object *target, int32_t argc, KorkApi::ConsoleValue argv[]) const {
+    if (target == nullptr || argc != 2) {
+        return KorkApi::ConsoleValue::makeUnsigned(0);
+    }
+
+    UtilityFunctions::print("Static Fields:");
+    const TypedArray<Dictionary> properties = target->get_property_list();
+    for (int i = 0; i < properties.size(); ++i) {
+        const Dictionary property = properties[i];
+        const String property_name = property.get("name", "");
+        if (property_name.is_empty()) {
+            continue;
+        }
+
+        const Variant value = target->get(StringName(property_name));
+        if (value.get_type() == Variant::NIL) {
+            continue;
+        }
+
+        UtilityFunctions::print(vformat("  %s = \"%s\"", property_name, value.stringify()));
+    }
+
+    UtilityFunctions::print("Dynamic Fields:");
+    UtilityFunctions::print("Methods:");
+
+    std::unordered_set<std::string> printed_methods;
+    const TypedArray<Dictionary> methods = target->get_method_list();
+    for (int i = 0; i < methods.size(); ++i) {
+        const Dictionary method = methods[i];
+        const String method_name = method.get("name", "");
+        if (method_name.is_empty()) {
+            continue;
+        }
+
+        const std::string key = intern_utf8(method_name);
+        if (!printed_methods.insert(key).second) {
+            continue;
+        }
+
+        UtilityFunctions::print(vformat("  %s()", method_name));
+    }
+
+    KorkApi::VMObject *vm_object = const_cast<KorkScriptVMHost *>(this)->get_or_create_vm_object(target, nullptr);
+    if (vm_object != nullptr) {
+        vm_->enumerateNamespace(vm_->getObjectNamespace(vm_object), &printed_methods, [](void *user_ptr, StringTableEntry func_name, const char *usage) {
+            std::unordered_set<std::string> *printed = static_cast<std::unordered_set<std::string> *>(user_ptr);
+            const std::string key(func_name ? func_name : "");
+            if (!printed->insert(key).second) {
+                return;
+            }
+
+            if (usage != nullptr && usage[0] != '\0') {
+                UtilityFunctions::print(vformat("  %s() - %s", String(func_name), String(usage)));
+            } else {
+                UtilityFunctions::print(vformat("  %s()", String(func_name)));
+            }
+        });
+    }
+
+    return KorkApi::ConsoleValue::makeUnsigned(0);
+}
+
+KorkApi::ConsoleValue KorkScriptVMHost::bridge_object_find_object(Object *target, int32_t argc, KorkApi::ConsoleValue argv[]) {
+    if (target == nullptr || argc != 3) {
+        return KorkApi::ConsoleValue::makeUnsigned(0);
+    }
+
+    Object *resolved = resolve_object_reference(target, console_value_to_string(argv[2]));
+    if (resolved == nullptr) {
+        return KorkApi::ConsoleValue::makeUnsigned(0);
+    }
+
+    get_or_create_vm_object(resolved, nullptr);
+    return KorkApi::ConsoleValue::makeUnsigned(ensure_sim_object_id(resolved));
+}
+
+KorkApi::ConsoleValue KorkScriptVMHost::bridge_object_get_parent(Object *target, int32_t argc, KorkApi::ConsoleValue argv[]) {
+    if (target == nullptr || argc != 2) {
+        return KorkApi::ConsoleValue::makeUnsigned(0);
+    }
+
+    Node *node = Object::cast_to<Node>(target);
+    if (node == nullptr) {
+        return KorkApi::ConsoleValue::makeUnsigned(0);
+    }
+
+    Node *parent = node->get_parent();
+    if (parent == nullptr) {
+        return KorkApi::ConsoleValue::makeUnsigned(0);
+    }
+
+    get_or_create_vm_object(parent, nullptr);
+    return KorkApi::ConsoleValue::makeUnsigned(ensure_sim_object_id(parent));
+}
+
+KorkApi::ConsoleValue KorkScriptVMHost::bridge_object_get_object(Object *target, int32_t argc, KorkApi::ConsoleValue argv[]) {
+    if (target == nullptr || argc != 3) {
+        return KorkApi::ConsoleValue::makeUnsigned(0);
+    }
+
+    Node *node = Object::cast_to<Node>(target);
+    if (node == nullptr) {
+        return KorkApi::ConsoleValue::makeUnsigned(0);
+    }
+
+    const int64_t index = parse_script_argument(argv[2]);
+    if (index < 0 || index >= node->get_child_count()) {
+        return KorkApi::ConsoleValue::makeUnsigned(0);
+    }
+
+    Node *child = node->get_child(static_cast<int32_t>(index));
+    if (child == nullptr) {
+        return KorkApi::ConsoleValue::makeUnsigned(0);
+    }
+
+    get_or_create_vm_object(child, nullptr);
+    return KorkApi::ConsoleValue::makeUnsigned(ensure_sim_object_id(child));
+}
+
+KorkApi::ConsoleValue KorkScriptVMHost::bridge_object_get_count(Object *target, int32_t argc, KorkApi::ConsoleValue argv[]) const {
+    if (target == nullptr || argc != 2) {
+        return KorkApi::ConsoleValue::makeUnsigned(0);
+    }
+
+    Node *node = Object::cast_to<Node>(target);
+    if (node == nullptr) {
+        return KorkApi::ConsoleValue::makeUnsigned(0);
+    }
+
+    return KorkApi::ConsoleValue::makeUnsigned(static_cast<uint64_t>(node->get_child_count()));
 }
 
 Variant KorkScriptVMHost::variant_from_console_value(KorkApi::ConsoleValue value) const {

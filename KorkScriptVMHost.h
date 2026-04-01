@@ -9,6 +9,7 @@
 #include <memory>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace godot {
@@ -60,6 +61,13 @@ private:
     static KorkApi::ConsoleValue object_get_callback(void *obj, void *user_ptr, int32_t argc, KorkApi::ConsoleValue argv[]);
     static KorkApi::ConsoleValue object_set_callback(void *obj, void *user_ptr, int32_t argc, KorkApi::ConsoleValue argv[]);
     static KorkApi::ConsoleValue object_print_callback(void *obj, void *user_ptr, int32_t argc, KorkApi::ConsoleValue argv[]);
+    static KorkApi::ConsoleValue object_get_id_callback(void *obj, void *user_ptr, int32_t argc, KorkApi::ConsoleValue argv[]);
+    static KorkApi::ConsoleValue object_get_name_callback(void *obj, void *user_ptr, int32_t argc, KorkApi::ConsoleValue argv[]);
+    static KorkApi::ConsoleValue object_dump_callback(void *obj, void *user_ptr, int32_t argc, KorkApi::ConsoleValue argv[]);
+    static KorkApi::ConsoleValue object_find_object_callback(void *obj, void *user_ptr, int32_t argc, KorkApi::ConsoleValue argv[]);
+    static KorkApi::ConsoleValue object_get_parent_callback(void *obj, void *user_ptr, int32_t argc, KorkApi::ConsoleValue argv[]);
+    static KorkApi::ConsoleValue object_get_object_callback(void *obj, void *user_ptr, int32_t argc, KorkApi::ConsoleValue argv[]);
+    static KorkApi::ConsoleValue object_get_count_callback(void *obj, void *user_ptr, int32_t argc, KorkApi::ConsoleValue argv[]);
 
     void initialize_vm();
     void reset_vm();
@@ -67,16 +75,27 @@ private:
     bool reload_known_scripts(const KorkScript *extra_script = nullptr);
     KorkApi::NamespaceId ensure_namespace_for_class(const StringName &class_name);
     void ensure_object_bridge_namespace();
-    KorkApi::SimObjectId ensure_sim_object_id(Object *owner);
+    KorkApi::SimObjectId ensure_sim_object_id(Object *owner) const;
     KorkApi::NamespaceId resolve_object_namespace(Object *owner, const KorkScript *script);
+    KorkApi::VMObject *get_or_create_vm_object(Object *owner, const KorkScript *script);
     void register_vm_object(Object *owner, KorkApi::VMObject *vm_object, KorkApi::SimObjectId sim_id);
     void unregister_vm_object(Object *owner, KorkApi::VMObject *vm_object);
     KorkApi::Vm *get_vm_for_generation(uint64_t generation) const;
+    const KorkScript *get_attached_korkscript(Object *owner) const;
+    String get_object_name(Object *owner) const;
+    Object *resolve_object_reference(Object *context_owner, const String &query) const;
 
     KorkApi::ConsoleValue bridge_object_call(Object *target, int32_t argc, KorkApi::ConsoleValue argv[]) const;
     KorkApi::ConsoleValue bridge_object_get(Object *target, int32_t argc, KorkApi::ConsoleValue argv[]) const;
     KorkApi::ConsoleValue bridge_object_set(Object *target, int32_t argc, KorkApi::ConsoleValue argv[]) const;
     KorkApi::ConsoleValue bridge_object_print(Object *target, int32_t argc, KorkApi::ConsoleValue argv[]) const;
+    KorkApi::ConsoleValue bridge_object_get_id(Object *target, int32_t argc, KorkApi::ConsoleValue argv[]) const;
+    KorkApi::ConsoleValue bridge_object_get_name(Object *target, int32_t argc, KorkApi::ConsoleValue argv[]) const;
+    KorkApi::ConsoleValue bridge_object_dump(Object *target, int32_t argc, KorkApi::ConsoleValue argv[]) const;
+    KorkApi::ConsoleValue bridge_object_find_object(Object *target, int32_t argc, KorkApi::ConsoleValue argv[]);
+    KorkApi::ConsoleValue bridge_object_get_parent(Object *target, int32_t argc, KorkApi::ConsoleValue argv[]);
+    KorkApi::ConsoleValue bridge_object_get_object(Object *target, int32_t argc, KorkApi::ConsoleValue argv[]);
+    KorkApi::ConsoleValue bridge_object_get_count(Object *target, int32_t argc, KorkApi::ConsoleValue argv[]) const;
 
     Variant variant_from_console_value(KorkApi::ConsoleValue value) const;
     KorkApi::ConsoleValue console_value_from_variant(const Variant &value) const;
@@ -95,6 +114,7 @@ private:
     KorkApi::TypeId vector4_type_id_;
     KorkApi::TypeId color_type_id_;
     mutable std::unordered_map<uint64_t, KorkApi::SimObjectId> sim_ids_;
+    std::unordered_map<uint64_t, KorkApi::VMObject *> vm_objects_by_owner_id_;
     std::unordered_map<KorkApi::SimObjectId, KorkApi::VMObject *> vm_objects_by_id_;
     std::unordered_map<std::string, KorkApi::VMObject *> vm_objects_by_name_;
     std::unordered_map<std::string, KorkApi::VMObject *> vm_objects_by_path_;
@@ -102,7 +122,7 @@ private:
     std::unordered_map<uint64_t, const KorkScript *> known_scripts_;
     std::unordered_map<uint64_t, ScriptLoadState> loaded_scripts_;
     std::vector<KorkApi::Vm *> retired_vms_;
-    KorkApi::SimObjectId next_sim_id_;
+    mutable KorkApi::SimObjectId next_sim_id_;
     uint64_t generation_;
     bool reload_pending_;
 };
