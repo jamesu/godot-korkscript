@@ -88,6 +88,7 @@ private:
     uint64_t revision_;
     std::unordered_set<std::string> method_names_;
     std::unordered_map<std::string, MethodMetadata> method_metadata_;
+    std::vector<std::string> method_order_;
 };
 
 } // namespace godot

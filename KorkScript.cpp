@@ -565,8 +565,11 @@ void KorkScript::_update_exports() {
 
 TypedArray<Dictionary> KorkScript::_get_script_method_list() const {
     TypedArray<Dictionary> out;
-    for (const auto &entry : method_metadata_) {
-        out.push_back(_get_method_info(StringName(entry.first.c_str())));
+    for (const std::string &method_name : method_order_) {
+        Dictionary method_info = _get_method_info(StringName(method_name.c_str()));
+        if (!method_info.is_empty()) {
+            out.push_back(method_info);
+        }
     }
     return out;
 }
@@ -585,8 +588,8 @@ int32_t KorkScript::_get_member_line(const StringName &p_member) const {
 
 TypedArray<StringName> KorkScript::_get_members() const {
     TypedArray<StringName> out;
-    for (const auto &entry : method_metadata_) {
-        out.push_back(StringName(entry.first.c_str()));
+    for (const std::string &method_name : method_order_) {
+        out.push_back(StringName(method_name.c_str()));
     }
     return out;
 }
@@ -609,6 +612,7 @@ void KorkScript::_bind_methods() {
 void KorkScript::refresh_method_cache() {
     method_names_.clear();
     method_metadata_.clear();
+    method_order_.clear();
     inferred_namespace_name_ = String();
 
     int from = 0;
@@ -627,6 +631,9 @@ void KorkScript::refresh_method_cache() {
             if (!method_name.is_empty()) {
                 const std::string method_key = string_name_key(StringName(method_name));
                 method_names_.insert(method_key);
+                if (method_metadata_.find(method_key) == method_metadata_.end()) {
+                    method_order_.push_back(method_key);
+                }
                 if (inferred_namespace_name_.is_empty() && !namespace_name.is_empty()) {
                     inferred_namespace_name_ = namespace_name;
                 }
