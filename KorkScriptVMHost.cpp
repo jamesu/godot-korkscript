@@ -1,6 +1,7 @@
 #include "KorkScriptVMHost.h"
 
 #include "KorkScript.h"
+#include "embed/compilerOpcodes.h"
 
 #include <godot_cpp/classes/class_db_singleton.hpp>
 #include <godot_cpp/classes/node.hpp>
@@ -20,6 +21,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <cmath>
 #include <unordered_set>
 
 namespace godot {
@@ -302,6 +304,170 @@ const char *color_type_name(void *) {
     return "Color";
 }
 
+template <typename TVec, int Components, typename ReadFn, typename WriteFn>
+KorkApi::ConsoleValue perform_pod_math_op_impl(void *user_ptr,
+        KorkApi::Vm *vm,
+        U32 op,
+        KorkApi::ConsoleValue lhs,
+        KorkApi::ConsoleValue rhs,
+        ReadFn read_fn,
+        WriteFn write_fn) {
+    const U32 self_type_id = *static_cast<const U32 *>(user_ptr);
+    TVec *lhs_value = lhs.typeId == self_type_id ? static_cast<TVec *>(lhs.evaluatePtr(vm->getAllocBase())) : nullptr;
+    TVec *rhs_value = rhs.typeId == self_type_id ? static_cast<TVec *>(rhs.evaluatePtr(vm->getAllocBase())) : nullptr;
+
+    KorkApi::ConsoleValue out_value;
+    TVec *out_ptr = nullptr;
+    double lhs_components[4] = {};
+    double rhs_components[4] = {};
+
+    if (lhs_value != nullptr) {
+        read_fn(*lhs_value, lhs_components);
+        out_value = lhs;
+        out_ptr = lhs_value;
+    } else if (rhs_value != nullptr) {
+        const double scalar = vm->valueAsFloat(lhs);
+        for (int i = 0; i < Components; ++i) {
+            lhs_components[i] = scalar;
+        }
+        out_value = rhs;
+        out_ptr = rhs_value;
+    } else {
+        return KorkApi::ConsoleValue();
+    }
+
+    if (rhs_value != nullptr) {
+        read_fn(*rhs_value, rhs_components);
+    } else {
+        const double scalar = vm->valueAsFloat(rhs);
+        for (int i = 0; i < Components; ++i) {
+            rhs_components[i] = scalar;
+        }
+    }
+
+    double out_components[4] = {};
+    switch (op) {
+        case Compiler::OP_ADD:
+            for (int i = 0; i < Components; ++i) {
+                out_components[i] = lhs_components[i] + rhs_components[i];
+            }
+            break;
+        case Compiler::OP_SUB:
+            for (int i = 0; i < Components; ++i) {
+                out_components[i] = lhs_components[i] - rhs_components[i];
+            }
+            break;
+        case Compiler::OP_MUL:
+            for (int i = 0; i < Components; ++i) {
+                out_components[i] = lhs_components[i] * rhs_components[i];
+            }
+            break;
+        case Compiler::OP_DIV:
+            for (int i = 0; i < Components; ++i) {
+                out_components[i] = rhs_components[i] == 0.0 ? 0.0 : (lhs_components[i] / rhs_components[i]);
+            }
+            break;
+        case Compiler::OP_NEG:
+            for (int i = 0; i < Components; ++i) {
+                out_components[i] = -lhs_components[i];
+            }
+            break;
+        case Compiler::OP_CMPEQ:
+        {
+            bool equal = true;
+            for (int i = 0; i < Components; ++i) {
+                if (lhs_components[i] != rhs_components[i]) {
+                    equal = false;
+                    break;
+                }
+            }
+            return KorkApi::ConsoleValue::makeUnsigned(equal ? 1 : 0);
+        }
+        case Compiler::OP_CMPNE:
+        {
+            bool not_equal = false;
+            for (int i = 0; i < Components; ++i) {
+                if (lhs_components[i] != rhs_components[i]) {
+                    not_equal = true;
+                    break;
+                }
+            }
+            return KorkApi::ConsoleValue::makeUnsigned(not_equal ? 1 : 0);
+        }
+        default:
+            return out_value;
+    }
+
+    if (out_ptr == nullptr) {
+        return KorkApi::ConsoleValue();
+    }
+
+    write_fn(*out_ptr, out_components);
+    return out_value;
+}
+
+KorkApi::ConsoleValue vector2_perform_op(void *user_ptr, KorkApi::Vm *vm, U32 op, KorkApi::ConsoleValue lhs, KorkApi::ConsoleValue rhs) {
+    return perform_pod_math_op_impl<Vector2, 2>(
+            user_ptr, vm, op, lhs, rhs,
+            [](const Vector2 &value, double *out_values) {
+                out_values[0] = value.x;
+                out_values[1] = value.y;
+            },
+            [](Vector2 &value, const double *in_values) {
+                value.x = static_cast<real_t>(in_values[0]);
+                value.y = static_cast<real_t>(in_values[1]);
+            });
+}
+
+KorkApi::ConsoleValue vector3_perform_op(void *user_ptr, KorkApi::Vm *vm, U32 op, KorkApi::ConsoleValue lhs, KorkApi::ConsoleValue rhs) {
+    return perform_pod_math_op_impl<Vector3, 3>(
+            user_ptr, vm, op, lhs, rhs,
+            [](const Vector3 &value, double *out_values) {
+                out_values[0] = value.x;
+                out_values[1] = value.y;
+                out_values[2] = value.z;
+            },
+            [](Vector3 &value, const double *in_values) {
+                value.x = static_cast<real_t>(in_values[0]);
+                value.y = static_cast<real_t>(in_values[1]);
+                value.z = static_cast<real_t>(in_values[2]);
+            });
+}
+
+KorkApi::ConsoleValue vector4_perform_op(void *user_ptr, KorkApi::Vm *vm, U32 op, KorkApi::ConsoleValue lhs, KorkApi::ConsoleValue rhs) {
+    return perform_pod_math_op_impl<Vector4, 4>(
+            user_ptr, vm, op, lhs, rhs,
+            [](const Vector4 &value, double *out_values) {
+                out_values[0] = value.x;
+                out_values[1] = value.y;
+                out_values[2] = value.z;
+                out_values[3] = value.w;
+            },
+            [](Vector4 &value, const double *in_values) {
+                value.x = static_cast<real_t>(in_values[0]);
+                value.y = static_cast<real_t>(in_values[1]);
+                value.z = static_cast<real_t>(in_values[2]);
+                value.w = static_cast<real_t>(in_values[3]);
+            });
+}
+
+KorkApi::ConsoleValue color_perform_op(void *user_ptr, KorkApi::Vm *vm, U32 op, KorkApi::ConsoleValue lhs, KorkApi::ConsoleValue rhs) {
+    return perform_pod_math_op_impl<Color, 4>(
+            user_ptr, vm, op, lhs, rhs,
+            [](const Color &value, double *out_values) {
+                out_values[0] = value.r;
+                out_values[1] = value.g;
+                out_values[2] = value.b;
+                out_values[3] = value.a;
+            },
+            [](Color &value, const double *in_values) {
+                value.r = static_cast<float>(in_values[0]);
+                value.g = static_cast<float>(in_values[1]);
+                value.b = static_cast<float>(in_values[2]);
+                value.a = static_cast<float>(in_values[3]);
+            });
+}
+
 } // namespace
 
 KorkScriptVMHost::KorkScriptVMHost(const String &vm_name) :
@@ -345,7 +511,7 @@ void KorkScriptVMHost::initialize_vm() {
     vector2_info.userPtr = &vector2_type_id_;
     vector2_info.fieldSize = sizeof(Vector2);
     vector2_info.valueSize = sizeof(Vector2);
-    vector2_info.iFuncs = { &vector2_cast_value, &vector2_type_name, nullptr, nullptr };
+    vector2_info.iFuncs = { &vector2_cast_value, &vector2_type_name, nullptr, &vector2_perform_op };
     vector2_type_id_ = vm_->registerType(vector2_info);
 
     KorkApi::TypeInfo vector3_info{};
@@ -353,7 +519,7 @@ void KorkScriptVMHost::initialize_vm() {
     vector3_info.userPtr = &vector3_type_id_;
     vector3_info.fieldSize = sizeof(Vector3);
     vector3_info.valueSize = sizeof(Vector3);
-    vector3_info.iFuncs = { &vector3_cast_value, &vector3_type_name, nullptr, nullptr };
+    vector3_info.iFuncs = { &vector3_cast_value, &vector3_type_name, nullptr, &vector3_perform_op };
     vector3_type_id_ = vm_->registerType(vector3_info);
 
     KorkApi::TypeInfo vector4_info{};
@@ -361,7 +527,7 @@ void KorkScriptVMHost::initialize_vm() {
     vector4_info.userPtr = &vector4_type_id_;
     vector4_info.fieldSize = sizeof(Vector4);
     vector4_info.valueSize = sizeof(Vector4);
-    vector4_info.iFuncs = { &vector4_cast_value, &vector4_type_name, nullptr, nullptr };
+    vector4_info.iFuncs = { &vector4_cast_value, &vector4_type_name, nullptr, &vector4_perform_op };
     vector4_type_id_ = vm_->registerType(vector4_info);
 
     KorkApi::TypeInfo color_info{};
@@ -369,9 +535,10 @@ void KorkScriptVMHost::initialize_vm() {
     color_info.userPtr = &color_type_id_;
     color_info.fieldSize = sizeof(Color);
     color_info.valueSize = sizeof(Color);
-    color_info.iFuncs = { &color_cast_value, &color_type_name, nullptr, nullptr };
+    color_info.iFuncs = { &color_cast_value, &color_type_name, nullptr, &color_perform_op };
     color_type_id_ = vm_->registerType(color_info);
 
+    ensure_global_math_namespace();
     ensure_object_bridge_namespace();
 
     KorkApi::ClassInfo class_info{};
@@ -757,6 +924,22 @@ void KorkScriptVMHost::log_callback(uint32_t level, const char *console_line, vo
     UtilityFunctions::print(vformat("[korkscript:%s:%d] %s", self->vm_name_, static_cast<int64_t>(level), String(console_line ? console_line : "")));
 }
 
+KorkApi::ConsoleValue KorkScriptVMHost::global_m_sin_callback(void *, void *user_ptr, int32_t argc, KorkApi::ConsoleValue argv[]) {
+    return static_cast<KorkScriptVMHost *>(user_ptr)->bridge_global_trig(argc, argv, static_cast<real_t (*)(real_t)>(std::sin));
+}
+
+KorkApi::ConsoleValue KorkScriptVMHost::global_m_cos_callback(void *, void *user_ptr, int32_t argc, KorkApi::ConsoleValue argv[]) {
+    return static_cast<KorkScriptVMHost *>(user_ptr)->bridge_global_trig(argc, argv, static_cast<real_t (*)(real_t)>(std::cos));
+}
+
+KorkApi::ConsoleValue KorkScriptVMHost::global_m_tan_callback(void *, void *user_ptr, int32_t argc, KorkApi::ConsoleValue argv[]) {
+    return static_cast<KorkScriptVMHost *>(user_ptr)->bridge_global_trig(argc, argv, static_cast<real_t (*)(real_t)>(std::tan));
+}
+
+KorkApi::ConsoleValue KorkScriptVMHost::global_get_word_callback(void *, void *user_ptr, int32_t argc, KorkApi::ConsoleValue argv[]) {
+    return static_cast<KorkScriptVMHost *>(user_ptr)->bridge_global_get_word(argc, argv);
+}
+
 KorkApi::VMObject *KorkScriptVMHost::find_by_name_callback(void *user_ptr, StringTableEntry name, KorkApi::VMObject *parent) {
     KorkScriptVMHost *self = static_cast<KorkScriptVMHost *>(user_ptr);
     if (self == nullptr || name == nullptr) {
@@ -896,6 +1079,14 @@ KorkApi::NamespaceId KorkScriptVMHost::ensure_namespace_for_class(const StringNa
         vm_->linkNamespaceById(parent, current);
     }
     return current;
+}
+
+void KorkScriptVMHost::ensure_global_math_namespace() {
+    KorkApi::NamespaceId global_ns = vm_->getGlobalNamespace();
+    vm_->addNamespaceFunction(global_ns, vm_->internString("mSin"), &KorkScriptVMHost::global_m_sin_callback, this, "(value)", 2, 2);
+    vm_->addNamespaceFunction(global_ns, vm_->internString("mCos"), &KorkScriptVMHost::global_m_cos_callback, this, "(value)", 2, 2);
+    vm_->addNamespaceFunction(global_ns, vm_->internString("mTan"), &KorkScriptVMHost::global_m_tan_callback, this, "(value)", 2, 2);
+    vm_->addNamespaceFunction(global_ns, vm_->internString("getWord"), &KorkScriptVMHost::global_get_word_callback, this, "(text, index)", 3, 3);
 }
 
 void KorkScriptVMHost::ensure_object_bridge_namespace() {
@@ -1177,6 +1368,48 @@ KorkApi::ConsoleValue KorkScriptVMHost::bridge_object_get_count(Object *target, 
     }
 
     return KorkApi::ConsoleValue::makeUnsigned(static_cast<uint64_t>(node->get_child_count()));
+}
+
+KorkApi::ConsoleValue KorkScriptVMHost::bridge_global_trig(int32_t argc, KorkApi::ConsoleValue argv[], real_t (*fn)(real_t)) const {
+    if (argc != 2 || fn == nullptr) {
+        return KorkApi::ConsoleValue::makeNumber(0.0);
+    }
+
+    const real_t value = static_cast<real_t>(parse_script_argument(argv[1]));
+    return KorkApi::ConsoleValue::makeNumber(static_cast<double>(fn(value)));
+}
+
+KorkApi::ConsoleValue KorkScriptVMHost::bridge_global_get_word(int32_t argc, KorkApi::ConsoleValue argv[]) const {
+    if (argc != 3) {
+        return KorkApi::ConsoleValue::makeString("");
+    }
+
+    const String text = console_value_to_string(argv[1]);
+    const int64_t index = parse_script_argument(argv[2]);
+    if (index < 0) {
+        return KorkApi::ConsoleValue::makeString("");
+    }
+
+    PackedStringArray words = text.split(" ", false);
+    PackedStringArray filtered_words;
+    for (int i = 0; i < words.size(); ++i) {
+        const String word = words[i].strip_edges();
+        if (!word.is_empty()) {
+            filtered_words.push_back(word);
+        }
+    }
+
+    if (index >= filtered_words.size()) {
+        return KorkApi::ConsoleValue::makeString("");
+    }
+
+    const CharString utf8 = filtered_words[static_cast<int32_t>(index)].utf8();
+    KorkApi::ConsoleValue buffer = vm_->getStringInZone(KorkApi::ConsoleValue::ZoneReturn, static_cast<uint32_t>(utf8.length() + 1));
+    char *out = static_cast<char *>(buffer.evaluatePtr(vm_->getAllocBase()));
+    if (out != nullptr) {
+        std::memcpy(out, utf8.get_data(), static_cast<size_t>(utf8.length() + 1));
+    }
+    return buffer;
 }
 
 Variant KorkScriptVMHost::variant_from_console_value(KorkApi::ConsoleValue value) const {
