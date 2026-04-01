@@ -10,6 +10,10 @@
 
 namespace godot {
 
+#ifndef KORKSCRIPT_LANGUAGE_NAME
+#define KORKSCRIPT_LANGUAGE_NAME "KorkScript"
+#endif
+
 KorkScriptLanguage *KorkScriptLanguage::singleton_ = nullptr;
 
 namespace {
@@ -137,7 +141,7 @@ void KorkScriptLanguage::notify_script_changed(const KorkScript *script) {
 }
 
 String KorkScriptLanguage::_get_name() const {
-    return "KorkScript";
+    return KORKSCRIPT_LANGUAGE_NAME;
 }
 
 void KorkScriptLanguage::_init() {

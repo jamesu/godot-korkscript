@@ -2,6 +2,7 @@ cmake_minimum_required(VERSION 3.16)
 
 set(GODOT_CPP_DIR "" CACHE PATH "Path to a godot-cpp checkout for the Godot extension")
 set(KS_BUILD_MODE "static" CACHE STRING "korkscript build mode" FORCE)
+set(KORKSCRIPT_GODOT_LANGUAGE_NAME "KorkScript" CACHE STRING "Editor-facing script language name shown by Godot")
 
 add_subdirectory(ext/korkscript EXCLUDE_FROM_ALL)
 
@@ -51,6 +52,8 @@ add_library(korkscript_godot SHARED
 target_link_libraries(korkscript_godot PRIVATE korkscript_ks ${KORKSCRIPT_GODOT_CPP_TARGET})
 target_sources(korkscript_godot PRIVATE ${KORKSCRIPT_GODOT_ENGINE_SRCS})
 target_include_directories(korkscript_godot PRIVATE "${CMAKE_SOURCE_DIR}" "${CMAKE_SOURCE_DIR}/engine")
+string(REPLACE "\"" "\\\"" KORKSCRIPT_GODOT_LANGUAGE_NAME_ESCAPED "${KORKSCRIPT_GODOT_LANGUAGE_NAME}")
+target_compile_definitions(korkscript_godot PRIVATE KORKSCRIPT_LANGUAGE_NAME="${KORKSCRIPT_GODOT_LANGUAGE_NAME_ESCAPED}")
 
 set_target_properties(korkscript_godot PROPERTIES
   CXX_STANDARD 17
