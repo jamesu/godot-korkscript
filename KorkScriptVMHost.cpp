@@ -10,6 +10,7 @@
 #include <godot_cpp/classes/window.hpp>
 #include <godot_cpp/core/class_db.hpp>
 #include <godot_cpp/variant/array.hpp>
+#include <godot_cpp/variant/callable.hpp>
 #include <godot_cpp/variant/dictionary.hpp>
 #include <godot_cpp/variant/string_name.hpp>
 #include <godot_cpp/variant/utility_functions.hpp>
@@ -1435,12 +1436,40 @@ KorkApi::ConsoleValue KorkScriptVMHost::bridge_object_call(Object *target, int32
         return KorkApi::ConsoleValue();
     }
 
+    const StringName method(console_value_to_string(argv[2]));
+    if (method == StringName("connect") && argc >= 6) {
+        const StringName signal_name(console_value_to_string(argv[3]));
+        const String target_handle = console_value_to_string(argv[4]).strip_edges();
+        Object *callable_target = resolve_object_reference(target, target_handle);
+        if (callable_target == nullptr) {
+            return console_value_from_variant_for_call(static_cast<int64_t>(ERR_INVALID_PARAMETER));
+        }
+
+        const StringName callable_method(console_value_to_string(argv[5]));
+        const Callable callable(callable_target, callable_method);
+        const uint32_t flags = argc >= 7 ? static_cast<uint32_t>(static_cast<int64_t>(parse_script_argument(argv[6]))) : 0;
+        const Error err = target->connect(signal_name, callable, static_cast<uint32_t>(flags));
+        return console_value_from_variant_for_call(static_cast<int64_t>(err));
+    }
+
+    if (method == StringName("disconnect") && argc >= 6) {
+        const StringName signal_name(console_value_to_string(argv[3]));
+        const String target_handle = console_value_to_string(argv[4]).strip_edges();
+        Object *callable_target = resolve_object_reference(target, target_handle);
+        if (callable_target == nullptr) {
+            return console_value_from_variant_for_call(static_cast<int64_t>(ERR_INVALID_PARAMETER));
+        }
+
+        const StringName callable_method(console_value_to_string(argv[5]));
+        target->disconnect(signal_name, Callable(callable_target, callable_method));
+        return console_value_from_variant_for_call(static_cast<int64_t>(OK));
+    }
+
     Array args;
     for (int32_t i = 3; i < argc; ++i) {
         args.push_back(parse_script_argument(argv[i]));
     }
 
-    const StringName method(console_value_to_string(argv[2]));
     return console_value_from_variant(target->callv(method, args));
 }
 
