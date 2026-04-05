@@ -70,6 +70,7 @@ bool KorkScriptVMNode::initialize_vm() {
     cfg.enableTuples = true;
     cfg.enableTypes = true;
     cfg.enableStringInterpolation = true;
+    cfg.enableSignals = true;
     cfg.warnUndefinedScriptVariables = true;
     cfg.maxFibers = 64;
 

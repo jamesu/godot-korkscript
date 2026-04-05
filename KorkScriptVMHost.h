@@ -4,6 +4,8 @@
 
 #include <godot_cpp/variant/string.hpp>
 #include <godot_cpp/variant/string_name.hpp>
+#include <godot_cpp/variant/dictionary.hpp>
+#include <godot_cpp/variant/typed_array.hpp>
 #include <godot_cpp/variant/variant.hpp>
 
 #include <memory>
@@ -36,6 +38,13 @@ public:
     void release_vm_object_for_generation(KorkApi::VMObject *vm_object, uint64_t generation);
 
     bool call_method(KorkApi::VMObject *vm_object, const StringName &method, const Variant **args, GDExtensionInt arg_count, Variant &ret) const;
+    bool has_signal(KorkApi::VMObject *vm_object, const StringName &signal) const;
+    void trigger_signal(KorkApi::VMObject *vm_object, const StringName &signal, const Variant **args, GDExtensionInt arg_count) const;
+    bool has_script_method(const KorkScript *script, const StringName &method);
+    Dictionary get_script_method_info(const KorkScript *script, const StringName &method);
+    TypedArray<Dictionary> get_script_method_list(const KorkScript *script);
+    bool has_script_signal(const KorkScript *script, const StringName &signal);
+    TypedArray<Dictionary> get_script_signal_list(const KorkScript *script);
 
     Variant get_property(Object *owner, const StringName &property) const;
     bool set_property(Object *owner, const StringName &property, const Variant &value) const;
@@ -79,6 +88,7 @@ private:
     bool reload_known_scripts(const KorkScript *extra_script = nullptr);
     void ensure_global_math_namespace();
     KorkApi::NamespaceId ensure_namespace_for_class(const StringName &class_name);
+    void install_object_bridge_methods(KorkApi::NamespaceId ns_id);
     void ensure_object_bridge_namespace();
     KorkApi::SimObjectId ensure_sim_object_id(Object *owner) const;
     KorkApi::NamespaceId resolve_object_namespace(Object *owner, const KorkScript *script);
@@ -89,6 +99,7 @@ private:
     const KorkScript *get_attached_korkscript(Object *owner) const;
     String get_object_name(Object *owner) const;
     Object *resolve_object_reference(Object *context_owner, const String &query) const;
+    KorkApi::NamespaceId get_script_namespace(const KorkScript *script) const;
 
     KorkApi::ConsoleValue bridge_object_call(Object *target, int32_t argc, KorkApi::ConsoleValue argv[]) const;
     KorkApi::ConsoleValue bridge_object_get(Object *target, int32_t argc, KorkApi::ConsoleValue argv[]) const;
@@ -103,6 +114,7 @@ private:
     KorkApi::ConsoleValue bridge_object_get_count(Object *target, int32_t argc, KorkApi::ConsoleValue argv[]) const;
     KorkApi::ConsoleValue bridge_global_trig(int32_t argc, KorkApi::ConsoleValue argv[], real_t (*fn)(real_t)) const;
     KorkApi::ConsoleValue bridge_global_get_word(int32_t argc, KorkApi::ConsoleValue argv[]) const;
+    void trigger_godot_signal(Object *owner, StringTableEntry signal_name, int argc, KorkApi::ConsoleValue *argv) const;
 
     Variant variant_from_console_value(KorkApi::ConsoleValue value) const;
     KorkApi::ConsoleValue console_value_from_variant(const Variant &value) const;

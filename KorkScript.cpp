@@ -3,6 +3,7 @@
 #include "KorkScriptLanguage.h"
 #include "KorkScriptVMHost.h"
 
+#include <godot_cpp/classes/engine.hpp>
 #include <godot_cpp/core/class_db.hpp>
 #include <godot_cpp/core/gdextension_interface_loader.hpp>
 #include <godot_cpp/core/memory.hpp>
@@ -22,6 +23,36 @@ struct KorkScriptInstance {
     uint64_t host_generation = 0;
     bool in_native_fallback = false;
 };
+
+bool is_editor_lifecycle_method(const StringName &name) {
+    return name == StringName("_ready") ||
+            name == StringName("_enter_tree") ||
+            name == StringName("_exit_tree") ||
+            name == StringName("_process") ||
+            name == StringName("_physics_process") ||
+            name == StringName("_internal_process") ||
+            name == StringName("_internal_physics_process") ||
+            name == StringName("_input") ||
+            name == StringName("_shortcut_input") ||
+            name == StringName("_unhandled_input") ||
+            name == StringName("_unhandled_key_input") ||
+            name == StringName("_input_event") ||
+            name == StringName("_gui_input") ||
+            name == StringName("_draw");
+}
+
+bool should_skip_editor_callback(const KorkScriptInstance *instance, const StringName &method_name) {
+    if (instance == nullptr || !instance->script.is_valid() || instance->script->is_tool_enabled()) {
+        return false;
+    }
+
+    Engine *engine = Engine::get_singleton();
+    if (engine == nullptr || !engine->is_editor_hint()) {
+        return false;
+    }
+
+    return is_editor_lifecycle_method(method_name);
+}
 
 bool sync_instance_vm_object(KorkScriptInstance *instance) {
     if (instance == nullptr || instance->host == nullptr || !instance->script.is_valid() || instance->owner == nullptr) {
@@ -106,7 +137,20 @@ GDExtensionBool instance_validate_property(GDExtensionScriptInstanceDataPtr, GDE
 
 GDExtensionBool instance_has_method(GDExtensionScriptInstanceDataPtr p_instance, GDExtensionConstStringNamePtr p_name) {
     KorkScriptInstance *instance = static_cast<KorkScriptInstance *>(p_instance);
-    return instance != nullptr && instance->script.is_valid() && instance->script->has_method_name(*reinterpret_cast<const StringName *>(p_name));
+    if (instance == nullptr || !instance->script.is_valid()) {
+        return false;
+    }
+
+    const StringName &name = *reinterpret_cast<const StringName *>(p_name);
+    if (should_skip_editor_callback(instance, name)) {
+        return false;
+    }
+
+    if (instance->script->has_method_name(name)) {
+        return true;
+    }
+
+    return sync_instance_vm_object(instance) && instance->host->has_signal(instance->vm_object, name);
 }
 
 GDExtensionInt instance_get_method_argument_count(GDExtensionScriptInstanceDataPtr, GDExtensionConstStringNamePtr, GDExtensionBool *r_is_valid) {
@@ -122,6 +166,22 @@ void instance_call(GDExtensionScriptInstanceDataPtr p_self, GDExtensionConstStri
     }
 
     const StringName &method_name = *reinterpret_cast<const StringName *>(p_method);
+    if (should_skip_editor_callback(instance, method_name)) {
+        *reinterpret_cast<Variant *>(r_return) = Variant();
+        set_call_error(r_error, GDEXTENSION_CALL_OK);
+        return;
+    }
+
+    if (instance->host->has_signal(instance->vm_object, method_name)) {
+        std::vector<const Variant *> signal_args(static_cast<size_t>(p_argument_count));
+        for (GDExtensionInt i = 0; i < p_argument_count; ++i) {
+            signal_args[static_cast<size_t>(i)] = reinterpret_cast<const Variant *>(p_args[i]);
+        }
+        instance->host->trigger_signal(instance->vm_object, method_name, signal_args.data(), p_argument_count);
+        *reinterpret_cast<Variant *>(r_return) = Variant();
+        set_call_error(r_error, GDEXTENSION_CALL_OK);
+        return;
+    }
 
     if (!instance->script.is_valid() || !instance->script->has_method_name(method_name)) {
         if (instance->in_native_fallback) {
@@ -359,6 +419,7 @@ KorkScript::KorkScript() :
         namespace_name_(""),
         inferred_namespace_name_(""),
         base_type_("Node"),
+        tool_enabled_(false),
         revision_(1) {
 }
 
@@ -391,6 +452,15 @@ void KorkScript::set_base_type(const String &base_type) {
     emit_changed();
 }
 
+void KorkScript::set_tool_enabled(bool enabled) {
+    if (tool_enabled_ == enabled) {
+        return;
+    }
+
+    tool_enabled_ = enabled;
+    emit_changed();
+}
+
 const String &KorkScript::get_vm_name() const {
     return vm_name_;
 }
@@ -401,6 +471,10 @@ const String &KorkScript::get_namespace_name() const {
 
 const String &KorkScript::get_base_type() const {
     return base_type_;
+}
+
+bool KorkScript::get_tool_enabled() const {
+    return tool_enabled_;
 }
 
 String KorkScript::get_effective_namespace_name() const {
@@ -419,6 +493,10 @@ uint64_t KorkScript::get_revision() const {
 
 bool KorkScript::has_method_name(const StringName &method) const {
     return method_names_.find(string_name_key(method)) != method_names_.end();
+}
+
+bool KorkScript::is_tool_enabled() const {
+    return _is_tool();
 }
 
 bool KorkScript::_editor_can_reload_from_file() {
@@ -499,7 +577,17 @@ TypedArray<Dictionary> KorkScript::_get_documentation() const {
 }
 
 bool KorkScript::_has_method(const StringName &p_method) const {
-    return has_method_name(p_method);
+    if (has_method_name(p_method)) {
+        return true;
+    }
+
+    KorkScriptLanguage *language = KorkScriptLanguage::get_singleton();
+    if (language == nullptr) {
+        return false;
+    }
+
+    KorkScriptVMHost *host = language->get_vm_host(vm_name_);
+    return host != nullptr && (host->has_script_method(this, p_method) || host->has_script_signal(this, p_method));
 }
 
 bool KorkScript::_has_static_method(const StringName &) const {
@@ -509,7 +597,23 @@ bool KorkScript::_has_static_method(const StringName &) const {
 Variant KorkScript::_get_script_method_argument_count(const StringName &p_method) const {
     const MethodMetadata *metadata = get_method_metadata(p_method);
     if (metadata == nullptr) {
-        return Variant();
+        KorkScriptLanguage *language = KorkScriptLanguage::get_singleton();
+        if (language == nullptr) {
+            return Variant();
+        }
+
+        KorkScriptVMHost *host = language->get_vm_host(vm_name_);
+        if (host == nullptr) {
+            return Variant();
+        }
+
+        const Dictionary method_info = host->get_script_method_info(this, p_method);
+        if (method_info.is_empty()) {
+            return Variant();
+        }
+
+        const Array arguments = method_info.get("args", Array());
+        return static_cast<int64_t>(arguments.size());
     }
     return static_cast<int64_t>(metadata->arguments.size());
 }
@@ -517,7 +621,13 @@ Variant KorkScript::_get_script_method_argument_count(const StringName &p_method
 Dictionary KorkScript::_get_method_info(const StringName &p_method) const {
     const MethodMetadata *metadata = get_method_metadata(p_method);
     if (metadata == nullptr) {
-        return Dictionary();
+        KorkScriptLanguage *language = KorkScriptLanguage::get_singleton();
+        if (language == nullptr) {
+            return Dictionary();
+        }
+
+        KorkScriptVMHost *host = language->get_vm_host(vm_name_);
+        return host != nullptr ? host->get_script_method_info(this, p_method) : Dictionary();
     }
 
     MethodInfo method_info(p_method);
@@ -529,7 +639,7 @@ Dictionary KorkScript::_get_method_info(const StringName &p_method) const {
 }
 
 bool KorkScript::_is_tool() const {
-    return false;
+    return tool_enabled_;
 }
 
 bool KorkScript::_is_valid() const {
@@ -544,12 +654,24 @@ ScriptLanguage *KorkScript::_get_language() const {
     return KorkScriptLanguage::get_singleton();
 }
 
-bool KorkScript::_has_script_signal(const StringName &) const {
-    return false;
+bool KorkScript::_has_script_signal(const StringName &p_signal) const {
+    KorkScriptLanguage *language = KorkScriptLanguage::get_singleton();
+    if (language == nullptr) {
+        return false;
+    }
+
+    KorkScriptVMHost *host = language->get_vm_host(vm_name_);
+    return host != nullptr && host->has_script_signal(this, p_signal);
 }
 
 TypedArray<Dictionary> KorkScript::_get_script_signal_list() const {
-    return TypedArray<Dictionary>();
+    KorkScriptLanguage *language = KorkScriptLanguage::get_singleton();
+    if (language == nullptr) {
+        return TypedArray<Dictionary>();
+    }
+
+    KorkScriptVMHost *host = language->get_vm_host(vm_name_);
+    return host != nullptr ? host->get_script_signal_list(this) : TypedArray<Dictionary>();
 }
 
 bool KorkScript::_has_property_default_value(const StringName &) const {
@@ -565,12 +687,41 @@ void KorkScript::_update_exports() {
 
 TypedArray<Dictionary> KorkScript::_get_script_method_list() const {
     TypedArray<Dictionary> out;
+    std::unordered_set<std::string> seen_methods;
     for (const std::string &method_name : method_order_) {
         Dictionary method_info = _get_method_info(StringName(method_name.c_str()));
         if (!method_info.is_empty()) {
+            seen_methods.insert(method_name);
             out.push_back(method_info);
         }
     }
+
+    KorkScriptLanguage *language = KorkScriptLanguage::get_singleton();
+    if (language == nullptr) {
+        return out;
+    }
+
+    KorkScriptVMHost *host = language->get_vm_host(vm_name_);
+    if (host == nullptr) {
+        return out;
+    }
+
+    const TypedArray<Dictionary> host_methods = host->get_script_method_list(this);
+    for (int i = 0; i < host_methods.size(); ++i) {
+        const Dictionary method_info = host_methods[i];
+        const String method_name = method_info.get("name", "");
+        if (method_name.is_empty()) {
+            continue;
+        }
+
+        const std::string key = string_name_key(StringName(method_name));
+        if (!seen_methods.insert(key).second) {
+            continue;
+        }
+
+        out.push_back(method_info);
+    }
+
     return out;
 }
 
@@ -588,9 +739,38 @@ int32_t KorkScript::_get_member_line(const StringName &p_member) const {
 
 TypedArray<StringName> KorkScript::_get_members() const {
     TypedArray<StringName> out;
+    std::unordered_set<std::string> seen_members;
     for (const std::string &method_name : method_order_) {
+        seen_members.insert(method_name);
         out.push_back(StringName(method_name.c_str()));
     }
+
+    KorkScriptLanguage *language = KorkScriptLanguage::get_singleton();
+    if (language == nullptr) {
+        return out;
+    }
+
+    KorkScriptVMHost *host = language->get_vm_host(vm_name_);
+    if (host == nullptr) {
+        return out;
+    }
+
+    const TypedArray<Dictionary> host_methods = host->get_script_method_list(this);
+    for (int i = 0; i < host_methods.size(); ++i) {
+        const Dictionary method_info = host_methods[i];
+        const String method_name = method_info.get("name", "");
+        if (method_name.is_empty()) {
+            continue;
+        }
+
+        const std::string key = string_name_key(StringName(method_name));
+        if (!seen_members.insert(key).second) {
+            continue;
+        }
+
+        out.push_back(StringName(method_name));
+    }
+
     return out;
 }
 
@@ -601,12 +781,15 @@ void KorkScript::_bind_methods() {
     ClassDB::bind_method(D_METHOD("get_namespace_name"), &KorkScript::get_namespace_name);
     ClassDB::bind_method(D_METHOD("set_base_type", "base_type"), &KorkScript::set_base_type);
     ClassDB::bind_method(D_METHOD("get_base_type"), &KorkScript::get_base_type);
+    ClassDB::bind_method(D_METHOD("set_tool_enabled", "enabled"), &KorkScript::set_tool_enabled);
+    ClassDB::bind_method(D_METHOD("get_tool_enabled"), &KorkScript::get_tool_enabled);
     ClassDB::bind_method(D_METHOD("set_source_code", "source_code"), &KorkScript::set_source_code);
     ClassDB::bind_method(D_METHOD("get_source_code"), &KorkScript::_get_source_code);
     ADD_PROPERTY(PropertyInfo(Variant::STRING, "source_code", PROPERTY_HINT_MULTILINE_TEXT), "set_source_code", "get_source_code");
     ADD_PROPERTY(PropertyInfo(Variant::STRING, "vm_name"), "set_vm_name", "get_vm_name");
     ADD_PROPERTY(PropertyInfo(Variant::STRING, "namespace_name"), "set_namespace_name", "get_namespace_name");
     ADD_PROPERTY(PropertyInfo(Variant::STRING, "base_type"), "set_base_type", "get_base_type");
+    ADD_PROPERTY(PropertyInfo(Variant::BOOL, "tool_enabled"), "set_tool_enabled", "get_tool_enabled");
 }
 
 void KorkScript::refresh_method_cache() {

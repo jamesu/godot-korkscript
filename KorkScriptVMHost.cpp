@@ -55,6 +55,32 @@ bool is_numeric_lookup(const String &value) {
     return true;
 }
 
+PackedStringArray parse_usage_argument_names(const char *usage) {
+    PackedStringArray out;
+    String usage_text = String(usage ? usage : "").strip_edges();
+    if (!usage_text.begins_with("(") || !usage_text.ends_with(")")) {
+        return out;
+    }
+
+    usage_text = usage_text.substr(1, usage_text.length() - 2).strip_edges();
+    if (usage_text.is_empty()) {
+        return out;
+    }
+
+    PackedStringArray parts = usage_text.split(",", false);
+    for (int i = 0; i < parts.size(); ++i) {
+        String arg_name = parts[i].strip_edges();
+        if (arg_name.begins_with("...")) {
+            arg_name = arg_name.substr(3).strip_edges();
+        }
+        if (!arg_name.is_empty()) {
+            out.push_back(arg_name);
+        }
+    }
+
+    return out;
+}
+
 String format_component(double value) {
     char buffer[64];
     std::snprintf(buffer, sizeof(buffer), "%.9g", value);
@@ -503,6 +529,7 @@ void KorkScriptVMHost::initialize_vm() {
     cfg.enableTypes = true;
     cfg.enableStringInterpolation = true;
     cfg.warnUndefinedScriptVariables = true;
+    cfg.enableSignals = true;
     cfg.maxFibers = 128;
 
     vm_ = KorkApi::createVM(&cfg);
@@ -554,6 +581,16 @@ void KorkScriptVMHost::initialize_vm() {
         nullptr,
         &KorkScriptVMHost::get_vm_object_id,
         &KorkScriptVMHost::get_vm_object_name
+    };
+    class_info.iSignals = {
+        [](void *, KorkApi::VMObject *object, StringTableEntry signal_name, int argc, KorkApi::ConsoleValue *argv) {
+            if (object == nullptr || object->klass == nullptr || object->klass->userPtr == nullptr) {
+                return;
+            }
+
+            KorkScriptVMHost *self = static_cast<KorkScriptVMHost *>(object->klass->userPtr);
+            self->trigger_godot_signal(static_cast<Object *>(object->userPtr), signal_name, argc, argv);
+        }
     };
     godot_object_class_id_ = vm_->registerClass(class_info);
 }
@@ -733,6 +770,7 @@ KorkApi::NamespaceId KorkScriptVMHost::resolve_object_namespace(Object *owner, c
 
     const std::string namespace_utf8 = intern_utf8(script_namespace_name);
     KorkApi::NamespaceId script_ns = vm_->findNamespace(vm_->internString(namespace_utf8.c_str()));
+    install_object_bridge_methods(script_ns);
     vm_->linkNamespaceById(class_ns, script_ns);
     return script_ns;
 }
@@ -899,6 +937,216 @@ bool KorkScriptVMHost::call_method(KorkApi::VMObject *vm_object, const StringNam
         ret = variant_from_console_value(result);
     }
     return ok;
+}
+
+bool KorkScriptVMHost::has_signal(KorkApi::VMObject *vm_object, const StringName &signal) const {
+    if (vm_ == nullptr || vm_object == nullptr) {
+        return false;
+    }
+
+    return vm_->isNamespaceSignal(vm_->getObjectNamespace(vm_object), vm_->internString(intern_utf8(signal).c_str()));
+}
+
+void KorkScriptVMHost::trigger_signal(KorkApi::VMObject *vm_object, const StringName &signal, const Variant **args, GDExtensionInt arg_count) const {
+    if (vm_ == nullptr || vm_object == nullptr) {
+        return;
+    }
+
+    std::vector<KorkApi::ConsoleValue> argv(static_cast<size_t>(arg_count));
+    for (GDExtensionInt i = 0; i < arg_count; ++i) {
+        argv[static_cast<size_t>(i)] = console_value_from_variant_for_call(*args[i]);
+    }
+
+    vm_object->klass->iSignals.TriggerSignal(nullptr, vm_object, vm_->internString(intern_utf8(signal).c_str()), static_cast<int>(argv.size()), argv.data());
+}
+
+KorkApi::NamespaceId KorkScriptVMHost::get_script_namespace(const KorkScript *script) const {
+    if (vm_ == nullptr || script == nullptr) {
+        return nullptr;
+    }
+
+    const String namespace_name = script->get_effective_namespace_name();
+    if (namespace_name.is_empty()) {
+        return nullptr;
+    }
+
+    return vm_->findNamespace(vm_->internString(intern_utf8(namespace_name).c_str()));
+}
+
+bool KorkScriptVMHost::has_script_method(const KorkScript *script, const StringName &method) {
+    if (script == nullptr || !ensure_script_loaded(script)) {
+        return false;
+    }
+
+    KorkApi::NamespaceId script_ns = get_script_namespace(script);
+    if (script_ns == nullptr) {
+        return false;
+    }
+
+    const std::string method_utf8 = intern_utf8(method);
+    struct MethodCheckCapture {
+        const std::string *target = nullptr;
+        bool found = false;
+    } capture{ &method_utf8, false };
+
+    vm_->enumerateNamespaceEntries(script_ns, &capture, [](void *user_ptr, const KorkApi::NamespaceEntryInfo *info) {
+        MethodCheckCapture *capture = static_cast<MethodCheckCapture *>(user_ptr);
+        if (capture->found || info == nullptr || info->kind != KorkApi::NamespaceEntryFunction || info->name == nullptr) {
+            return;
+        }
+
+        if (*capture->target == info->name) {
+            capture->found = true;
+        }
+    });
+    return capture.found;
+}
+
+Dictionary KorkScriptVMHost::get_script_method_info(const KorkScript *script, const StringName &method) {
+    Dictionary out;
+    if (script == nullptr || !ensure_script_loaded(script)) {
+        return out;
+    }
+
+    KorkApi::NamespaceId script_ns = get_script_namespace(script);
+    if (script_ns == nullptr) {
+        return out;
+    }
+
+    const std::string method_utf8 = intern_utf8(method);
+    struct MethodInfoCapture {
+        const std::string *target = nullptr;
+        Dictionary *result = nullptr;
+        bool found = false;
+    } capture{ &method_utf8, &out, false };
+
+    vm_->enumerateNamespaceEntries(script_ns, &capture, [](void *user_ptr, const KorkApi::NamespaceEntryInfo *info) {
+        MethodInfoCapture *capture = static_cast<MethodInfoCapture *>(user_ptr);
+        if (capture->found || info == nullptr || info->kind != KorkApi::NamespaceEntryFunction || info->name == nullptr) {
+            return;
+        }
+
+        if (*capture->target != info->name) {
+            return;
+        }
+
+        MethodInfo method_info(StringName(info->name));
+        const PackedStringArray arg_names = parse_usage_argument_names(info->usage);
+        for (int i = 0; i < arg_names.size(); ++i) {
+            method_info.arguments.push_back(PropertyInfo(Variant::NIL, arg_names[i]));
+        }
+        *capture->result = method_info.operator Dictionary();
+        capture->found = true;
+    });
+
+    return out;
+}
+
+TypedArray<Dictionary> KorkScriptVMHost::get_script_method_list(const KorkScript *script) {
+    TypedArray<Dictionary> out;
+    if (script == nullptr || !ensure_script_loaded(script)) {
+        return out;
+    }
+
+    KorkApi::NamespaceId script_ns = get_script_namespace(script);
+    if (script_ns == nullptr) {
+        return out;
+    }
+
+    struct MethodCapture {
+        TypedArray<Dictionary> *methods = nullptr;
+        std::unordered_set<std::string> seen;
+    } capture{ &out, {} };
+
+    vm_->enumerateNamespaceEntries(script_ns, &capture, [](void *user_ptr, const KorkApi::NamespaceEntryInfo *info) {
+        if (info == nullptr || info->kind != KorkApi::NamespaceEntryFunction || info->name == nullptr) {
+            return;
+        }
+
+        MethodCapture *capture = static_cast<MethodCapture *>(user_ptr);
+        const std::string key(info->name);
+        if (!capture->seen.insert(key).second) {
+            return;
+        }
+
+        MethodInfo method_info(StringName(info->name));
+        const PackedStringArray arg_names = parse_usage_argument_names(info->usage);
+        for (int i = 0; i < arg_names.size(); ++i) {
+            method_info.arguments.push_back(PropertyInfo(Variant::NIL, arg_names[i]));
+        }
+        capture->methods->push_back(method_info.operator Dictionary());
+    });
+
+    return out;
+}
+
+bool KorkScriptVMHost::has_script_signal(const KorkScript *script, const StringName &signal) {
+    if (script == nullptr || !ensure_script_loaded(script)) {
+        return false;
+    }
+
+    KorkApi::NamespaceId script_ns = get_script_namespace(script);
+    return script_ns != nullptr && vm_->isNamespaceSignal(script_ns, vm_->internString(intern_utf8(signal).c_str()));
+}
+
+TypedArray<Dictionary> KorkScriptVMHost::get_script_signal_list(const KorkScript *script) {
+    TypedArray<Dictionary> out;
+    if (script == nullptr || !ensure_script_loaded(script)) {
+        return out;
+    }
+
+    KorkApi::NamespaceId script_ns = get_script_namespace(script);
+    if (script_ns == nullptr) {
+        return out;
+    }
+
+    struct SignalCapture {
+        TypedArray<Dictionary> *signals = nullptr;
+        std::unordered_set<std::string> seen;
+    } capture{ &out, {} };
+
+    vm_->enumerateNamespaceEntries(script_ns, &capture, [](void *user_ptr, const KorkApi::NamespaceEntryInfo *info) {
+        if (info == nullptr || info->kind != KorkApi::NamespaceEntrySignal || info->name == nullptr) {
+            return;
+        }
+
+        SignalCapture *capture = static_cast<SignalCapture *>(user_ptr);
+        const std::string key(info->name);
+        if (!capture->seen.insert(key).second) {
+            return;
+        }
+
+        Dictionary signal_info;
+        signal_info["name"] = String(info->name);
+
+        Array args;
+        const PackedStringArray arg_names = parse_usage_argument_names(info->usage);
+        for (int i = 0; i < arg_names.size(); ++i) {
+            Dictionary arg_info;
+            arg_info["name"] = arg_names[i];
+            arg_info["type"] = static_cast<int64_t>(Variant::NIL);
+            args.push_back(arg_info);
+        }
+        signal_info["args"] = args;
+        signal_info["default_args"] = Array();
+        capture->signals->push_back(signal_info);
+    });
+
+    return out;
+}
+
+void KorkScriptVMHost::trigger_godot_signal(Object *owner, StringTableEntry signal_name, int argc, KorkApi::ConsoleValue *argv) const {
+    if (owner == nullptr || signal_name == nullptr) {
+        return;
+    }
+
+    Array args;
+    args.push_back(String(signal_name));
+    for (int i = 0; i < argc; ++i) {
+        args.push_back(parse_script_argument(argv[i]));
+    }
+
+    owner->callv(StringName("emit_signal"), args);
 }
 
 Variant KorkScriptVMHost::get_property(Object *owner, const StringName &property) const {
@@ -1081,6 +1329,24 @@ KorkApi::NamespaceId KorkScriptVMHost::ensure_namespace_for_class(const StringNa
     return current;
 }
 
+void KorkScriptVMHost::install_object_bridge_methods(KorkApi::NamespaceId ns_id) {
+    if (vm_ == nullptr || ns_id == nullptr) {
+        return;
+    }
+
+    vm_->addNamespaceFunction(ns_id, vm_->internString("call"), &KorkScriptVMHost::object_call_callback, this, "(method, ...args)", 3, KorkApi::Constants::MaxArgs);
+    vm_->addNamespaceFunction(ns_id, vm_->internString("get"), &KorkScriptVMHost::object_get_callback, this, "(property)", 3, 3);
+    vm_->addNamespaceFunction(ns_id, vm_->internString("set"), &KorkScriptVMHost::object_set_callback, this, "(property, value)", 4, 4);
+    vm_->addNamespaceFunction(ns_id, vm_->internString("print"), &KorkScriptVMHost::object_print_callback, this, "(...args)", 2, KorkApi::Constants::MaxArgs);
+    vm_->addNamespaceFunction(ns_id, vm_->internString("getId"), &KorkScriptVMHost::object_get_id_callback, this, "()", 2, 2);
+    vm_->addNamespaceFunction(ns_id, vm_->internString("getName"), &KorkScriptVMHost::object_get_name_callback, this, "()", 2, 2);
+    vm_->addNamespaceFunction(ns_id, vm_->internString("dump"), &KorkScriptVMHost::object_dump_callback, this, "()", 2, 2);
+    vm_->addNamespaceFunction(ns_id, vm_->internString("findObject"), &KorkScriptVMHost::object_find_object_callback, this, "(path)", 3, 3);
+    vm_->addNamespaceFunction(ns_id, vm_->internString("getParent"), &KorkScriptVMHost::object_get_parent_callback, this, "()", 2, 2);
+    vm_->addNamespaceFunction(ns_id, vm_->internString("getObject"), &KorkScriptVMHost::object_get_object_callback, this, "(index)", 3, 3);
+    vm_->addNamespaceFunction(ns_id, vm_->internString("getCount"), &KorkScriptVMHost::object_get_count_callback, this, "()", 2, 2);
+}
+
 void KorkScriptVMHost::ensure_global_math_namespace() {
     KorkApi::NamespaceId global_ns = vm_->getGlobalNamespace();
     vm_->addNamespaceFunction(global_ns, vm_->internString("mSin"), &KorkScriptVMHost::global_m_sin_callback, this, "(value)", 2, 2);
@@ -1091,17 +1357,7 @@ void KorkScriptVMHost::ensure_global_math_namespace() {
 
 void KorkScriptVMHost::ensure_object_bridge_namespace() {
     KorkApi::NamespaceId object_ns = ensure_namespace_for_class("Object");
-    vm_->addNamespaceFunction(object_ns, vm_->internString("call"), &KorkScriptVMHost::object_call_callback, this, "(method, ...args)", 3, KorkApi::Constants::MaxArgs);
-    vm_->addNamespaceFunction(object_ns, vm_->internString("get"), &KorkScriptVMHost::object_get_callback, this, "(property)", 3, 3);
-    vm_->addNamespaceFunction(object_ns, vm_->internString("set"), &KorkScriptVMHost::object_set_callback, this, "(property, value)", 4, 4);
-    vm_->addNamespaceFunction(object_ns, vm_->internString("print"), &KorkScriptVMHost::object_print_callback, this, "(...args)", 2, KorkApi::Constants::MaxArgs);
-    vm_->addNamespaceFunction(object_ns, vm_->internString("getId"), &KorkScriptVMHost::object_get_id_callback, this, "()", 2, 2);
-    vm_->addNamespaceFunction(object_ns, vm_->internString("getName"), &KorkScriptVMHost::object_get_name_callback, this, "()", 2, 2);
-    vm_->addNamespaceFunction(object_ns, vm_->internString("dump"), &KorkScriptVMHost::object_dump_callback, this, "()", 2, 2);
-    vm_->addNamespaceFunction(object_ns, vm_->internString("findObject"), &KorkScriptVMHost::object_find_object_callback, this, "(path)", 3, 3);
-    vm_->addNamespaceFunction(object_ns, vm_->internString("getParent"), &KorkScriptVMHost::object_get_parent_callback, this, "()", 2, 2);
-    vm_->addNamespaceFunction(object_ns, vm_->internString("getObject"), &KorkScriptVMHost::object_get_object_callback, this, "(index)", 3, 3);
-    vm_->addNamespaceFunction(object_ns, vm_->internString("getCount"), &KorkScriptVMHost::object_get_count_callback, this, "()", 2, 2);
+    install_object_bridge_methods(object_ns);
 }
 
 KorkApi::SimObjectId KorkScriptVMHost::ensure_sim_object_id(Object *owner) const {
@@ -1282,17 +1538,26 @@ KorkApi::ConsoleValue KorkScriptVMHost::bridge_object_dump(Object *target, int32
 
     KorkApi::VMObject *vm_object = const_cast<KorkScriptVMHost *>(this)->get_or_create_vm_object(target, nullptr);
     if (vm_object != nullptr) {
-        vm_->enumerateNamespace(vm_->getObjectNamespace(vm_object), &printed_methods, [](void *user_ptr, StringTableEntry func_name, const char *usage) {
+        vm_->enumerateNamespaceEntries(vm_->getObjectNamespace(vm_object), &printed_methods, [](void *user_ptr, const KorkApi::NamespaceEntryInfo *info) {
+            if (info == nullptr || info->name == nullptr) {
+                return;
+            }
+
+            if (info->kind != KorkApi::NamespaceEntryFunction && info->kind != KorkApi::NamespaceEntrySignal) {
+                return;
+            }
+
             std::unordered_set<std::string> *printed = static_cast<std::unordered_set<std::string> *>(user_ptr);
-            const std::string key(func_name ? func_name : "");
+            const std::string key(info->name);
             if (!printed->insert(key).second) {
                 return;
             }
 
+            const char *usage = info->usage != nullptr ? info->usage : "";
             if (usage != nullptr && usage[0] != '\0') {
-                UtilityFunctions::print(vformat("  %s() - %s", String(func_name), String(usage)));
+                UtilityFunctions::print(vformat(info->kind == KorkApi::NamespaceEntrySignal ? "  [signal] %s() - %s" : "  %s() - %s", String(info->name), String(usage)));
             } else {
-                UtilityFunctions::print(vformat("  %s()", String(func_name)));
+                UtilityFunctions::print(vformat(info->kind == KorkApi::NamespaceEntrySignal ? "  [signal] %s()" : "  %s()", String(info->name)));
             }
         });
     }

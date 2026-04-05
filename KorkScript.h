@@ -22,13 +22,16 @@ public:
     void set_vm_name(const String &vm_name);
     void set_namespace_name(const String &namespace_name);
     void set_base_type(const String &base_type);
+    void set_tool_enabled(bool enabled);
 
     const String &get_vm_name() const;
     const String &get_namespace_name() const;
     const String &get_base_type() const;
+    bool get_tool_enabled() const;
     String get_effective_namespace_name() const;
     uint64_t get_revision() const;
     bool has_method_name(const StringName &method) const;
+    bool is_tool_enabled() const;
 
     bool _editor_can_reload_from_file() override;
     bool _can_instantiate() const override;
@@ -85,6 +88,7 @@ private:
     String namespace_name_;
     String inferred_namespace_name_;
     String base_type_;
+    bool tool_enabled_;
     uint64_t revision_;
     std::unordered_set<std::string> method_names_;
     std::unordered_map<std::string, MethodMetadata> method_metadata_;
