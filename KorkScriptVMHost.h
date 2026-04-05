@@ -64,6 +64,7 @@ private:
     static KorkApi::ConsoleValue global_m_cos_callback(void *obj, void *user_ptr, int32_t argc, KorkApi::ConsoleValue argv[]);
     static KorkApi::ConsoleValue global_m_tan_callback(void *obj, void *user_ptr, int32_t argc, KorkApi::ConsoleValue argv[]);
     static KorkApi::ConsoleValue global_get_word_callback(void *obj, void *user_ptr, int32_t argc, KorkApi::ConsoleValue argv[]);
+    static KorkApi::ConsoleValue global_is_object_callback(void *obj, void *user_ptr, int32_t argc, KorkApi::ConsoleValue argv[]);
     static KorkApi::VMObject *find_by_name_callback(void *user_ptr, StringTableEntry name, KorkApi::VMObject *parent);
     static KorkApi::VMObject *find_by_path_callback(void *user_ptr, const char *path);
     static KorkApi::VMObject *find_by_id_callback(void *user_ptr, KorkApi::SimObjectId ident);
@@ -114,6 +115,7 @@ private:
     KorkApi::ConsoleValue bridge_object_get_count(Object *target, int32_t argc, KorkApi::ConsoleValue argv[]) const;
     KorkApi::ConsoleValue bridge_global_trig(int32_t argc, KorkApi::ConsoleValue argv[], real_t (*fn)(real_t)) const;
     KorkApi::ConsoleValue bridge_global_get_word(int32_t argc, KorkApi::ConsoleValue argv[]) const;
+    KorkApi::ConsoleValue bridge_global_is_object(int32_t argc, KorkApi::ConsoleValue argv[]) const;
     void trigger_godot_signal(Object *owner, StringTableEntry signal_name, int argc, KorkApi::ConsoleValue *argv) const;
 
     Variant variant_from_console_value(KorkApi::ConsoleValue value) const;

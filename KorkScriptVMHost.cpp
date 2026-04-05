@@ -1188,6 +1188,10 @@ KorkApi::ConsoleValue KorkScriptVMHost::global_get_word_callback(void *, void *u
     return static_cast<KorkScriptVMHost *>(user_ptr)->bridge_global_get_word(argc, argv);
 }
 
+KorkApi::ConsoleValue KorkScriptVMHost::global_is_object_callback(void *, void *user_ptr, int32_t argc, KorkApi::ConsoleValue argv[]) {
+    return static_cast<KorkScriptVMHost *>(user_ptr)->bridge_global_is_object(argc, argv);
+}
+
 KorkApi::VMObject *KorkScriptVMHost::find_by_name_callback(void *user_ptr, StringTableEntry name, KorkApi::VMObject *parent) {
     KorkScriptVMHost *self = static_cast<KorkScriptVMHost *>(user_ptr);
     if (self == nullptr || name == nullptr) {
@@ -1353,6 +1357,7 @@ void KorkScriptVMHost::ensure_global_math_namespace() {
     vm_->addNamespaceFunction(global_ns, vm_->internString("mCos"), &KorkScriptVMHost::global_m_cos_callback, this, "(value)", 2, 2);
     vm_->addNamespaceFunction(global_ns, vm_->internString("mTan"), &KorkScriptVMHost::global_m_tan_callback, this, "(value)", 2, 2);
     vm_->addNamespaceFunction(global_ns, vm_->internString("getWord"), &KorkScriptVMHost::global_get_word_callback, this, "(text, index)", 3, 3);
+    vm_->addNamespaceFunction(global_ns, vm_->internString("isObject"), &KorkScriptVMHost::global_is_object_callback, this, "(handle)", 2, 2);
 }
 
 void KorkScriptVMHost::ensure_object_bridge_namespace() {
@@ -1675,6 +1680,20 @@ KorkApi::ConsoleValue KorkScriptVMHost::bridge_global_get_word(int32_t argc, Kor
         std::memcpy(out, utf8.get_data(), static_cast<size_t>(utf8.length() + 1));
     }
     return buffer;
+}
+
+KorkApi::ConsoleValue KorkScriptVMHost::bridge_global_is_object(int32_t argc, KorkApi::ConsoleValue argv[]) const {
+    if (argc != 2) {
+        return KorkApi::ConsoleValue::makeUnsigned(0);
+    }
+
+    const String handle = console_value_to_string(argv[1]).strip_edges();
+    if (handle.is_empty() || handle == "0") {
+        return KorkApi::ConsoleValue::makeUnsigned(0);
+    }
+
+    Object *resolved = resolve_object_reference(nullptr, handle);
+    return KorkApi::ConsoleValue::makeUnsigned(resolved != nullptr ? 1 : 0);
 }
 
 Variant KorkScriptVMHost::variant_from_console_value(KorkApi::ConsoleValue value) const {
