@@ -107,6 +107,9 @@ private:
     void notify_owner_property_list_changed(Object *owner) const;
     void push_execution_target(uint64_t owner_key) const;
     void pop_execution_target() const;
+    Variant value_from_console_assignment_args(U32 argc, KorkApi::ConsoleValue *argv) const;
+    bool try_get_object_property(Object *owner, const StringName &property, Variant &value) const;
+    bool try_set_object_property(Object *owner, const StringName &property, const Variant &value) const;
     uint64_t get_dynamic_field_owner_key(const KorkApi::VMObject *vm_object) const;
     uint64_t get_dynamic_field_owner_key(const Object *owner) const;
     KorkApi::SimObjectId ensure_sim_object_id(Object *owner) const;

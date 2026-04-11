@@ -1260,6 +1260,49 @@ bool KorkScriptVMHost::is_current_execution_target(KorkApi::VMObject *vm_object)
     return execution_target_stack_.back() == get_dynamic_field_owner_key(vm_object);
 }
 
+Variant KorkScriptVMHost::value_from_console_assignment_args(U32 argc, KorkApi::ConsoleValue *argv) const {
+    if (argc == 0 || argv == nullptr) {
+        return Variant();
+    }
+
+    if (argc == 1) {
+        if (argv[0].isFloat()) {
+            return argv[0].getFloat();
+        }
+        if (argv[0].isUnsigned()) {
+            return static_cast<int64_t>(argv[0].getInt());
+        }
+        return parse_script_argument(argv[0]);
+    }
+
+    PackedStringArray parts;
+    for (U32 i = 0; i < argc; ++i) {
+        parts.push_back(console_value_to_string(argv[i]));
+    }
+    return String(" ").join(parts);
+}
+
+bool KorkScriptVMHost::try_get_object_property(Object *owner, const StringName &property, Variant &value) const {
+    if (!has_godot_property(owner, property)) {
+        return false;
+    }
+
+    value = owner->get(property);
+    return true;
+}
+
+bool KorkScriptVMHost::try_set_object_property(Object *owner, const StringName &property, const Variant &value) const {
+    owner->set(property, value);
+
+    const Variant readback = owner->get(property);
+    if ((readback.get_type() != Variant::NIL || has_godot_property(owner, property)) && readback == value) {
+        notify_owner_property_list_changed(owner);
+        return true;
+    }
+
+    return false;
+}
+
 void KorkScriptVMHost::add_instance_property_state(KorkApi::VMObject *vm_object, GDExtensionScriptInstancePropertyStateAdd add_func, void *userdata) const {
     if (vm_object == nullptr || add_func == nullptr) {
         return;
@@ -1400,14 +1443,16 @@ KorkApi::ConsoleValue KorkScriptVMHost::custom_field_get_by_name_callback(KorkAp
         if (entry != nullptr) {
             return self->console_value_from_variant(entry->value);
         }
-        if (self->has_godot_property(owner, property_name)) {
-            return self->console_value_from_variant(owner->get(property_name));
+        Variant property_value;
+        if (self->try_get_object_property(owner, property_name, property_value)) {
+            return self->console_value_from_variant(property_value);
         }
         return KorkApi::ConsoleValue();
     }
 
-    if (self->has_godot_property(owner, property_name)) {
-        return self->console_value_from_variant(owner->get(property_name));
+    Variant property_value;
+    if (self->try_get_object_property(owner, property_name, property_value)) {
+        return self->console_value_from_variant(property_value);
     }
 
     return entry != nullptr ? self->console_value_from_variant(entry->value) : KorkApi::ConsoleValue();
@@ -1421,42 +1466,17 @@ void KorkScriptVMHost::custom_field_set_by_name_callback(KorkApi::Vm *, KorkApi:
     KorkScriptVMHost *self = static_cast<KorkScriptVMHost *>(object->klass->userPtr);
     Object *owner = static_cast<Object *>(object->userPtr);
     const StringName property_name(name);
-    if (!self->is_current_execution_target(object) && self->has_godot_property(owner, property_name)) {
-        Variant value;
-        if (argc == 0 || argv == nullptr) {
-            value = Variant();
-        } else if (argc == 1) {
-            value = self->parse_script_argument(argv[0]);
-        } else {
-            PackedStringArray parts;
-            for (U32 i = 0; i < argc; ++i) {
-                parts.push_back(self->console_value_to_string(argv[i]));
-            }
-            value = String(" ").join(parts);
+    const Variant value = self->value_from_console_assignment_args(argc, argv);
+
+    if (!self->is_current_execution_target(object)) {
+        if (self->try_set_object_property(owner, property_name, value)) {
+            return;
         }
-        owner->set(property_name, value);
-        return;
     }
 
     const bool is_new_field = self->find_dynamic_field_entry(self->get_dynamic_field_owner_key(object), std::string_view(name)) == nullptr;
     DynamicFieldEntry *entry = self->upsert_dynamic_field_entry(self->get_dynamic_field_owner_key(object), std::string_view(name));
-    if (argc == 0 || argv == nullptr) {
-        entry->value = Variant();
-    } else if (argc == 1) {
-        if (argv[0].isFloat()) {
-            entry->value = argv[0].getFloat();
-        } else if (argv[0].isUnsigned()) {
-            entry->value = static_cast<int64_t>(argv[0].getInt());
-        } else {
-            entry->value = self->parse_script_argument(argv[0]);
-        }
-    } else {
-        PackedStringArray parts;
-        for (U32 i = 0; i < argc; ++i) {
-            parts.push_back(self->console_value_to_string(argv[i]));
-        }
-        entry->value = String(" ").join(parts);
-    }
+    entry->value = value;
     entry->type = entry->value.get_type();
     if (is_new_field) {
         self->notify_owner_property_list_changed(owner);
@@ -1654,7 +1674,7 @@ bool KorkScriptVMHost::has_godot_property(Object *owner, const StringName &prope
         return false;
     }
 
-    const TypedArray<Dictionary> properties = ClassDBSingleton::get_singleton()->class_get_property_list(owner->get_class());
+    const TypedArray<Dictionary> properties = owner->get_property_list();
     for (int i = 0; i < properties.size(); ++i) {
         const Dictionary info = properties[i];
         if (StringName(info.get("name", Variant())) == property) {
@@ -1867,6 +1887,7 @@ KorkApi::ConsoleValue KorkScriptVMHost::bridge_object_set(Object *target, int32_
         return KorkApi::ConsoleValue::makeUnsigned(0);
     }
     target->set(StringName(console_value_to_string(argv[2])), parse_script_argument(argv[3]));
+    notify_owner_property_list_changed(target);
     return KorkApi::ConsoleValue::makeUnsigned(1);
 }
 
