@@ -4,11 +4,14 @@
 #include "KorkScriptVMHost.h"
 
 #include <godot_cpp/classes/engine.hpp>
+#include <godot_cpp/classes/class_db_singleton.hpp>
+#include <godot_cpp/classes/global_constants.hpp>
 #include <godot_cpp/core/class_db.hpp>
 #include <godot_cpp/core/gdextension_interface_loader.hpp>
 #include <godot_cpp/core/memory.hpp>
 #include <godot_cpp/core/object.hpp>
 
+#include <unordered_map>
 #include <vector>
 
 namespace godot {
@@ -23,6 +26,16 @@ struct KorkScriptInstance {
     uint64_t host_generation = 0;
     bool in_native_fallback = false;
 };
+
+struct ScriptPropertyListAllocation {
+    GDExtensionPropertyInfo *infos = nullptr;
+    StringName *names = nullptr;
+    StringName *class_names = nullptr;
+    String *hint_strings = nullptr;
+    uint32_t count = 0;
+};
+
+std::unordered_map<const GDExtensionPropertyInfo *, ScriptPropertyListAllocation> g_script_property_lists;
 
 bool is_editor_lifecycle_method(const StringName &name) {
     return name == StringName("_ready") ||
@@ -52,6 +65,21 @@ bool should_skip_editor_callback(const KorkScriptInstance *instance, const Strin
     }
 
     return is_editor_lifecycle_method(method_name);
+}
+
+bool owner_has_godot_property(const KorkScriptInstance *instance, const StringName &property_name) {
+    if (instance == nullptr || instance->owner == nullptr || property_name.is_empty()) {
+        return false;
+    }
+
+    const TypedArray<Dictionary> properties = ClassDBSingleton::get_singleton()->class_get_property_list(instance->owner->get_class());
+    for (int i = 0; i < properties.size(); ++i) {
+        const Dictionary info = properties[i];
+        if (StringName(info.get("name", Variant())) == property_name) {
+            return true;
+        }
+    }
+    return false;
 }
 
 bool sync_instance_vm_object(KorkScriptInstance *instance) {
@@ -87,19 +115,96 @@ void set_call_error(GDExtensionCallError *r_error, GDExtensionCallErrorType erro
 }
 
 GDExtensionBool instance_set(GDExtensionScriptInstanceDataPtr p_instance, GDExtensionConstStringNamePtr p_name, GDExtensionConstVariantPtr p_value) {
-    return false;
+    KorkScriptInstance *instance = static_cast<KorkScriptInstance *>(p_instance);
+    if (!sync_instance_vm_object(instance)) {
+        return false;
+    }
+
+    const StringName &name = *reinterpret_cast<const StringName *>(p_name);
+    if (owner_has_godot_property(instance, name)) {
+        return false;
+    }
+
+    const Variant &value = *reinterpret_cast<const Variant *>(p_value);
+    return instance->host->set_instance_field(instance->vm_object, name, value);
 }
 
 GDExtensionBool instance_get(GDExtensionScriptInstanceDataPtr p_instance, GDExtensionConstStringNamePtr p_name, GDExtensionVariantPtr r_ret) {
-    return false;
+    KorkScriptInstance *instance = static_cast<KorkScriptInstance *>(p_instance);
+    if (!sync_instance_vm_object(instance)) {
+        return false;
+    }
+
+    const StringName &name = *reinterpret_cast<const StringName *>(p_name);
+    if (owner_has_godot_property(instance, name)) {
+        return false;
+    }
+
+    Variant value;
+    if (!instance->host->get_instance_field(instance->vm_object, name, value)) {
+        return false;
+    }
+
+    *reinterpret_cast<Variant *>(r_ret) = value;
+    return true;
 }
 
-const GDExtensionPropertyInfo *instance_get_property_list(GDExtensionScriptInstanceDataPtr, uint32_t *r_count) {
+const GDExtensionPropertyInfo *instance_get_property_list(GDExtensionScriptInstanceDataPtr p_instance, uint32_t *r_count) {
+    KorkScriptInstance *instance = static_cast<KorkScriptInstance *>(p_instance);
+    if (r_count == nullptr) {
+        return nullptr;
+    }
     *r_count = 0;
-    return nullptr;
+
+    if (!sync_instance_vm_object(instance)) {
+        return nullptr;
+    }
+
+    const TypedArray<Dictionary> properties = instance->host->get_instance_field_list(instance->vm_object);
+    const uint32_t count = static_cast<uint32_t>(properties.size());
+    if (count == 0) {
+        return nullptr;
+    }
+
+    ScriptPropertyListAllocation allocation;
+    allocation.count = count;
+    allocation.infos = memnew_arr(GDExtensionPropertyInfo, count);
+    allocation.names = memnew_arr(StringName, count);
+    allocation.class_names = memnew_arr(StringName, count);
+    allocation.hint_strings = memnew_arr(String, count);
+
+    for (uint32_t i = 0; i < count; ++i) {
+        const Dictionary property = properties[static_cast<int32_t>(i)];
+        allocation.names[i] = StringName(property.get("name", ""));
+        allocation.class_names[i] = StringName();
+        allocation.hint_strings[i] = String(property.get("hint_string", ""));
+
+        allocation.infos[i].type = static_cast<GDExtensionVariantType>(static_cast<int64_t>(property.get("type", static_cast<int64_t>(Variant::NIL))));
+        allocation.infos[i].name = &allocation.names[i];
+        allocation.infos[i].class_name = &allocation.class_names[i];
+        allocation.infos[i].hint = static_cast<uint32_t>(static_cast<int64_t>(property.get("hint", static_cast<int64_t>(PROPERTY_HINT_NONE))));
+        allocation.infos[i].hint_string = &allocation.hint_strings[i];
+        allocation.infos[i].usage = static_cast<uint32_t>(static_cast<int64_t>(property.get("usage", static_cast<int64_t>(PROPERTY_USAGE_DEFAULT | PROPERTY_USAGE_SCRIPT_VARIABLE))));
+    }
+
+    const GDExtensionPropertyInfo *list = allocation.infos;
+    g_script_property_lists.emplace(list, std::move(allocation));
+    *r_count = count;
+    return list;
 }
 
-void instance_free_property_list(GDExtensionScriptInstanceDataPtr, const GDExtensionPropertyInfo *, uint32_t) {
+void instance_free_property_list(GDExtensionScriptInstanceDataPtr, const GDExtensionPropertyInfo *p_list, uint32_t) {
+    auto found = g_script_property_lists.find(p_list);
+    if (found == g_script_property_lists.end()) {
+        return;
+    }
+
+    ScriptPropertyListAllocation &allocation = found->second;
+    memdelete_arr(allocation.infos);
+    memdelete_arr(allocation.names);
+    memdelete_arr(allocation.class_names);
+    memdelete_arr(allocation.hint_strings);
+    g_script_property_lists.erase(found);
 }
 
 GDExtensionBool instance_property_can_revert(GDExtensionScriptInstanceDataPtr, GDExtensionConstStringNamePtr) {
@@ -115,7 +220,13 @@ GDExtensionObjectPtr instance_get_owner(GDExtensionScriptInstanceDataPtr p_insta
     return instance != nullptr && instance->owner != nullptr ? instance->owner->_owner : nullptr;
 }
 
-void instance_get_property_state(GDExtensionScriptInstanceDataPtr, GDExtensionScriptInstancePropertyStateAdd, void *) {
+void instance_get_property_state(GDExtensionScriptInstanceDataPtr p_instance, GDExtensionScriptInstancePropertyStateAdd p_add_func, void *p_userdata) {
+    KorkScriptInstance *instance = static_cast<KorkScriptInstance *>(p_instance);
+    if (!sync_instance_vm_object(instance)) {
+        return;
+    }
+
+    instance->host->add_instance_property_state(instance->vm_object, p_add_func, p_userdata);
 }
 
 const GDExtensionMethodInfo *instance_get_method_list(GDExtensionScriptInstanceDataPtr, uint32_t *r_count) {
@@ -126,9 +237,23 @@ const GDExtensionMethodInfo *instance_get_method_list(GDExtensionScriptInstanceD
 void instance_free_method_list(GDExtensionScriptInstanceDataPtr, const GDExtensionMethodInfo *, uint32_t) {
 }
 
-GDExtensionVariantType instance_get_property_type(GDExtensionScriptInstanceDataPtr, GDExtensionConstStringNamePtr, GDExtensionBool *r_is_valid) {
-    *r_is_valid = false;
-    return GDEXTENSION_VARIANT_TYPE_NIL;
+GDExtensionVariantType instance_get_property_type(GDExtensionScriptInstanceDataPtr p_instance, GDExtensionConstStringNamePtr p_name, GDExtensionBool *r_is_valid) {
+    KorkScriptInstance *instance = static_cast<KorkScriptInstance *>(p_instance);
+    if (!sync_instance_vm_object(instance)) {
+        *r_is_valid = false;
+        return GDEXTENSION_VARIANT_TYPE_NIL;
+    }
+
+    const StringName &name = *reinterpret_cast<const StringName *>(p_name);
+    if (owner_has_godot_property(instance, name)) {
+        *r_is_valid = false;
+        return GDEXTENSION_VARIANT_TYPE_NIL;
+    }
+
+    bool exists = false;
+    const Variant::Type type = instance->host->get_instance_field_type(instance->vm_object, name, &exists);
+    *r_is_valid = exists;
+    return static_cast<GDExtensionVariantType>(type);
 }
 
 GDExtensionBool instance_validate_property(GDExtensionScriptInstanceDataPtr, GDExtensionPropertyInfo *) {
