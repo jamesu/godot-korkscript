@@ -111,6 +111,8 @@ private:
     void seed_script_class_defaults(Object *owner, KorkApi::VMObject *vm_object, const KorkScript *script);
     bool get_declared_script_default(Object *owner, const StringName &field, Variant &value) const;
     bool has_declared_script_field(Object *owner, const StringName &field, Variant::Type *r_type = nullptr) const;
+    bool get_declared_field_value(const KorkApi::VMObject *vm_object, const StringName &field, Variant &value) const;
+    void set_declared_field_value(KorkApi::VMObject *vm_object, const StringName &field, const Variant &value);
     void push_execution_target(uint64_t owner_key) const;
     void pop_execution_target() const;
     Variant value_from_console_assignment_args(U32 argc, KorkApi::ConsoleValue *argv) const;
