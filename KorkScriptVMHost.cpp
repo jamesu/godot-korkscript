@@ -689,6 +689,7 @@ void KorkScriptVMHost::reset_vm() {
         vm_ = nullptr;
     }
 
+    godot_class_ids_by_name_.clear();
     vm_objects_by_owner_id_.clear();
     vm_objects_by_id_.clear();
     vm_objects_by_name_.clear();
