@@ -544,6 +544,59 @@ int32_t find_method_line_in_code(const String &code, const String &method_name) 
     return -1;
 }
 
+String infer_class_name_from_code(const String &code) {
+    int from = 0;
+    while (true) {
+        const int class_pos = code.find("class ", from);
+        if (class_pos < 0) {
+            return String();
+        }
+
+        int name_start = class_pos + 6;
+        while (name_start < code.length() && String::chr(code[name_start]).strip_edges().is_empty()) {
+            ++name_start;
+        }
+
+        int name_end = name_start;
+        while (name_end < code.length()) {
+            const char32_t c = code[name_end];
+            const bool valid_ident = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_';
+            if (!valid_ident) {
+                break;
+            }
+            ++name_end;
+        }
+
+        const String class_name = code.substr(name_start, name_end - name_start).strip_edges();
+        if (!class_name.is_empty()) {
+            return class_name;
+        }
+
+        from = class_pos + 6;
+    }
+}
+
+String infer_namespace_from_signal_decls(const String &code) {
+    int from = 0;
+    while (true) {
+        const int signal_pos = code.find("signal ", from);
+        if (signal_pos < 0) {
+            return String();
+        }
+
+        const int ns_pos = code.find("::", signal_pos);
+        const int open_paren = code.find("(", signal_pos);
+        if (ns_pos > signal_pos && open_paren > ns_pos) {
+            const String namespace_name = code.substr(signal_pos + 7, ns_pos - (signal_pos + 7)).strip_edges();
+            if (!namespace_name.is_empty()) {
+                return namespace_name;
+            }
+        }
+
+        from = signal_pos + 7;
+    }
+}
+
 KorkScript::MethodArgumentMetadata parse_method_argument(const String &argument_text) {
     KorkScript::MethodArgumentMetadata metadata;
     String token = argument_text.strip_edges();
@@ -965,6 +1018,11 @@ void KorkScript::refresh_method_cache() {
     method_order_.clear();
     inferred_namespace_name_ = String();
 
+    const String inferred_class_name = infer_class_name_from_code(source_code_);
+    if (!inferred_class_name.is_empty()) {
+        inferred_namespace_name_ = inferred_class_name;
+    }
+
     int from = 0;
     while (true) {
         const int function_pos = source_code_.find("function ", from);
@@ -1007,6 +1065,10 @@ void KorkScript::refresh_method_cache() {
         }
 
         from = function_pos + 8;
+    }
+
+    if (inferred_namespace_name_.is_empty()) {
+        inferred_namespace_name_ = infer_namespace_from_signal_decls(source_code_);
     }
 }
 
