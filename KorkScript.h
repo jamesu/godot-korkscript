@@ -27,6 +27,8 @@ public:
     const String &get_vm_name() const;
     const String &get_namespace_name() const;
     const String &get_base_type() const;
+    const String &get_source_code_ref() const;
+    const String &get_declared_script_class_parent_name() const;
     bool get_tool_enabled() const;
     String get_effective_namespace_name() const;
     uint64_t get_revision() const;
@@ -112,6 +114,7 @@ private:
     String vm_name_;
     String namespace_name_;
     String inferred_namespace_name_;
+    String declared_script_class_parent_name_;
     String base_type_;
     bool tool_enabled_;
     uint64_t revision_;

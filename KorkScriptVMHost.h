@@ -2,6 +2,7 @@
 
 #include "embed/api.h"
 
+#include <godot_cpp/classes/ref.hpp>
 #include <godot_cpp/variant/string.hpp>
 #include <godot_cpp/variant/string_name.hpp>
 #include <godot_cpp/variant/dictionary.hpp>
@@ -60,7 +61,7 @@ public:
 
 private:
     struct ActiveScriptState {
-        const KorkScript *script = nullptr;
+        Ref<KorkScript> script;
         uint32_t ref_count = 0;
     };
 
@@ -193,7 +194,7 @@ private:
     std::unordered_map<std::string, KorkApi::ClassId> godot_class_ids_by_name_;
     std::unordered_map<uint64_t, DynamicFieldState> dynamic_fields_by_owner_id_;
     std::unordered_map<uint64_t, ActiveScriptState> active_scripts_;
-    std::unordered_map<uint64_t, const KorkScript *> known_scripts_;
+    std::unordered_map<uint64_t, Ref<KorkScript>> known_scripts_;
     std::unordered_map<uint64_t, ScriptLoadState> loaded_scripts_;
     std::vector<KorkApi::Vm *> retired_vms_;
     mutable KorkApi::SimObjectId next_sim_id_;

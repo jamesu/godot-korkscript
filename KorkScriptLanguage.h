@@ -35,6 +35,7 @@ public:
     Dictionary _validate(const String &p_script, const String &p_path, bool p_validate_functions, bool p_validate_errors, bool p_validate_warnings, bool p_validate_safe_lines) const override;
     String _validate_path(const String &p_path) const override;
     Object *_create_script() const override;
+    bool _has_named_classes() const override;
     bool _supports_builtin_mode() const override;
     bool _supports_documentation() const override;
     bool _can_inherit_from_file() const override;

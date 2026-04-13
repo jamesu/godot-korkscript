@@ -39,44 +39,6 @@ std::string make_node_path_key(Node *node) {
     return std::string(utf8.get_data(), static_cast<size_t>(utf8.length()));
 }
 
-PackedStringArray infer_script_class_parent_names(const String &code) {
-    PackedStringArray parents;
-    int from = 0;
-    while (true) {
-        const int class_pos = code.find("class ", from);
-        if (class_pos < 0) {
-            break;
-        }
-
-        const int open_brace = code.find("{", class_pos);
-        const int colon_pos = code.find(":", class_pos);
-        if (colon_pos > class_pos && open_brace > colon_pos) {
-            int parent_start = colon_pos + 1;
-            while (parent_start < open_brace && String::chr(code[parent_start]).strip_edges().is_empty()) {
-                ++parent_start;
-            }
-
-            int parent_end = parent_start;
-            while (parent_end < open_brace) {
-                const char32_t c = code[parent_end];
-                const bool valid_ident = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_';
-                if (!valid_ident) {
-                    break;
-                }
-                ++parent_end;
-            }
-
-            const String parent_name = code.substr(parent_start, parent_end - parent_start).strip_edges();
-            if (!parent_name.is_empty()) {
-                parents.push_back(parent_name);
-            }
-        }
-
-        from = class_pos + 6;
-    }
-    return parents;
-}
-
 bool is_numeric_lookup(const String &value) {
     if (value.is_empty()) {
         return false;
@@ -714,20 +676,26 @@ bool KorkScriptVMHost::eval_script_source(const KorkScript *script) {
         return false;
     }
 
-    known_scripts_[reinterpret_cast<uint64_t>(script)] = script;
+    known_scripts_[reinterpret_cast<uint64_t>(script)] = Ref<KorkScript>(const_cast<KorkScript *>(script));
 
-    ensure_class_for_godot_type(script->get_base_type());
-    const PackedStringArray class_parents = infer_script_class_parent_names(script->get_source_code());
-    for (int i = 0; i < class_parents.size(); ++i) {
-        ensure_class_for_godot_type(StringName(class_parents[i]));
+    const String base_type = script->get_base_type();
+    if (!base_type.is_empty()) {
+        ensure_class_for_godot_type(base_type);
     }
 
-    const CharString source_utf8 = script->get_source_code().utf8();
-    String path = script->get_path();
-    if (path.is_empty()) {
-        path = vformat("res://%s_inline.ks", vm_name_);
+    const String source_code = script->get_source_code_ref();
+    const String declared_parent = script->get_declared_script_class_parent_name().strip_edges();
+    if (!declared_parent.is_empty()) {
+        ensure_class_for_godot_type(declared_parent);
     }
-    const CharString path_utf8 = path.utf8();
+
+    const CharString source_utf8 = source_code.utf8();
+    String filename = script->get_effective_namespace_name().strip_edges();
+    if (filename.is_empty()) {
+        filename = String("KorkScript");
+    }
+    filename = vformat("res://%s_%s.ks", vm_name_, filename);
+    const CharString path_utf8 = filename.utf8();
 
     vm_->evalCode(source_utf8.get_data(), path_utf8.get_data(), "");
     if (vm_->getCurrentFiberState() == KorkApi::FiberRunResult::ERROR) {
@@ -742,7 +710,8 @@ bool KorkScriptVMHost::eval_script_source(const KorkScript *script) {
 
 bool KorkScriptVMHost::reload_known_scripts(const KorkScript *extra_script) {
     for (const auto &entry : known_scripts_) {
-        if (!eval_script_source(entry.second)) {
+        const Ref<KorkScript> &script_ref = entry.second;
+        if (!script_ref.is_valid() || !eval_script_source(script_ref.ptr())) {
             return false;
         }
     }
@@ -763,7 +732,7 @@ bool KorkScriptVMHost::ensure_script_loaded(const KorkScript *script) {
     }
 
     const uint64_t key = reinterpret_cast<uint64_t>(script);
-    known_scripts_[key] = script;
+    known_scripts_[key] = Ref<KorkScript>(const_cast<KorkScript *>(script));
 
     if (reload_pending_) {
         reset_vm();
@@ -789,7 +758,7 @@ void KorkScriptVMHost::notify_script_changed(const KorkScript *script) {
         return;
     }
 
-    known_scripts_[reinterpret_cast<uint64_t>(script)] = script;
+    known_scripts_[reinterpret_cast<uint64_t>(script)] = Ref<KorkScript>(const_cast<KorkScript *>(script));
     reload_pending_ = true;
 }
 
@@ -799,7 +768,7 @@ void KorkScriptVMHost::retain_script(const KorkScript *script) {
     }
 
     ActiveScriptState &state = active_scripts_[reinterpret_cast<uint64_t>(script)];
-    state.script = script;
+    state.script = Ref<KorkScript>(const_cast<KorkScript *>(script));
     ++state.ref_count;
 }
 
@@ -1302,17 +1271,7 @@ Variant::Type KorkScriptVMHost::get_instance_field_type(KorkApi::VMObject *vm_ob
 }
 
 void KorkScriptVMHost::refresh_script_class_defaults(const KorkScript *script) {
-    if (script == nullptr) {
-        return;
-    }
-
-    for (const auto &entry : vm_objects_by_owner_id_) {
-        Object *owner = Object::cast_to<Object>(UtilityFunctions::instance_from_id(static_cast<int64_t>(entry.first)));
-        if (owner == nullptr || get_attached_korkscript(owner) != script) {
-            continue;
-        }
-        notify_owner_property_list_changed(owner);
-    }
+    (void)script;
 }
 
 TypedArray<Dictionary> KorkScriptVMHost::get_instance_field_list(KorkApi::VMObject *vm_object) const {
