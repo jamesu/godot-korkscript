@@ -21,8 +21,6 @@
 #include <godot_cpp/variant/vector4.hpp>
 
 #include <cstdio>
-#include <cstdlib>
-#include <cstring>
 #include <cmath>
 #include <unordered_set>
 
@@ -32,14 +30,6 @@ namespace {
 
 KorkApi::FieldInfo g_empty_field_info{};
 
-bool korkscript_debug_types_enabled() {
-    static const bool enabled = []() {
-        const char *value = std::getenv("KORKSCRIPT_DEBUG_TYPES");
-        return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
-    }();
-    return enabled;
-}
-
 std::string make_node_path_key(Node *node) {
     if (node == nullptr || !node->is_inside_tree()) {
         return std::string();
@@ -47,6 +37,44 @@ std::string make_node_path_key(Node *node) {
 
     const CharString utf8 = String(node->get_path()).utf8();
     return std::string(utf8.get_data(), static_cast<size_t>(utf8.length()));
+}
+
+PackedStringArray infer_script_class_parent_names(const String &code) {
+    PackedStringArray parents;
+    int from = 0;
+    while (true) {
+        const int class_pos = code.find("class ", from);
+        if (class_pos < 0) {
+            break;
+        }
+
+        const int open_brace = code.find("{", class_pos);
+        const int colon_pos = code.find(":", class_pos);
+        if (colon_pos > class_pos && open_brace > colon_pos) {
+            int parent_start = colon_pos + 1;
+            while (parent_start < open_brace && String::chr(code[parent_start]).strip_edges().is_empty()) {
+                ++parent_start;
+            }
+
+            int parent_end = parent_start;
+            while (parent_end < open_brace) {
+                const char32_t c = code[parent_end];
+                const bool valid_ident = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_';
+                if (!valid_ident) {
+                    break;
+                }
+                ++parent_end;
+            }
+
+            const String parent_name = code.substr(parent_start, parent_end - parent_start).strip_edges();
+            if (!parent_name.is_empty()) {
+                parents.push_back(parent_name);
+            }
+        }
+
+        from = class_pos + 6;
+    }
+    return parents;
 }
 
 bool is_numeric_lookup(const String &value) {
@@ -92,18 +120,6 @@ String format_component(double value) {
     char buffer[64];
     std::snprintf(buffer, sizeof(buffer), "%.9g", value);
     return String(buffer);
-}
-
-void debug_log_console_value(const char *label, const KorkApi::ConsoleValue &value) {
-    if (!korkscript_debug_types_enabled()) {
-        return;
-    }
-
-    UtilityFunctions::print(String("[korkscript-debug] ")
-            + String(label)
-            + " type=" + String::num_int64(value.typeId)
-            + " zone=" + String::num_int64(value.zoneId)
-            + " raw=" + String::num_uint64(value.cvalue));
 }
 
 bool parse_space_separated_components(const char *input, int expected_components, double *out_values) {
@@ -210,12 +226,6 @@ bool cast_pod_value_impl(KorkApi::Vm *vm,
         std::memcpy(out, utf8.get_data(), static_cast<size_t>(len));
         if (output_storage->data.storageRegister) {
             *output_storage->data.storageRegister = output_storage->data.storageAddress;
-        }
-        if (korkscript_debug_types_enabled()) {
-            UtilityFunctions::print(String("[korkscript-debug] cast->string requested=")
-                    + String::num_int64(requested_type)
-                    + " argc=" + String::num_int64(argc)
-                    + " text='" + text + "'");
         }
         return true;
     }
@@ -539,7 +549,8 @@ KorkScriptVMHost::KorkScriptVMHost(const String &vm_name) :
         next_sim_id_(1),
         generation_(1),
         reload_pending_(false),
-        script_instance_field_write_depth_(0) {
+        script_instance_field_write_depth_(0),
+        script_instance_field_read_depth_(0) {
     initialize_vm();
 }
 
@@ -693,6 +704,12 @@ bool KorkScriptVMHost::eval_script_source(const KorkScript *script) {
     }
 
     known_scripts_[reinterpret_cast<uint64_t>(script)] = script;
+
+    ensure_class_for_godot_type(script->get_base_type());
+    const PackedStringArray class_parents = infer_script_class_parent_names(script->get_source_code());
+    for (int i = 0; i < class_parents.size(); ++i) {
+        ensure_class_for_godot_type(StringName(class_parents[i]));
+    }
 
     const CharString source_utf8 = script->get_source_code().utf8();
     String path = script->get_path();
@@ -922,8 +939,12 @@ KorkApi::VMObject *KorkScriptVMHost::get_or_create_vm_object(Object *owner, cons
         if (!class_mismatch) {
             found->second->flags |= KorkApi::ModDynamicFields;
             vm_->setObjectNamespace(found->second, desired_namespace);
-            if ((found->second->flags & KorkApi::ModScriptCtorInvoked) == 0) {
+            const bool has_ctor = desired_namespace != nullptr &&
+                    vm_->isNamespaceFunction(desired_namespace, vm_->internString("__kork_ctor"));
+            if (has_ctor && (found->second->flags & KorkApi::ModScriptCtorInvoked) == 0) {
                 vm_->invokeScriptClassConstructor(found->second);
+            } else if (!has_ctor) {
+                found->second->flags |= KorkApi::ModScriptCtorInvoked;
             }
             return found->second;
         }
@@ -936,10 +957,14 @@ KorkApi::VMObject *KorkScriptVMHost::get_or_create_vm_object(Object *owner, cons
     KorkApi::VMObject *vm_object = vm_->createVMObject(desired_class_id, owner);
     vm_object->flags |= KorkApi::ModDynamicFields;
     vm_->setObjectNamespace(vm_object, desired_namespace);
-    if (!vm_->invokeScriptClassConstructor(vm_object)) {
+    const bool has_ctor = desired_namespace != nullptr &&
+            vm_->isNamespaceFunction(desired_namespace, vm_->internString("__kork_ctor"));
+    if (has_ctor && !vm_->invokeScriptClassConstructor(vm_object)) {
         UtilityFunctions::push_error(vformat("Failed to invoke Kork script class constructor for '%s'.", String(vm_->getClassName(desired_class_id))));
         vm_->decVMRef(vm_object);
         return nullptr;
+    } else if (!has_ctor) {
+        vm_object->flags |= KorkApi::ModScriptCtorInvoked;
     }
     register_vm_object(owner, vm_object, sim_id);
     return vm_object;
@@ -1197,13 +1222,6 @@ bool KorkScriptVMHost::set_instance_field(KorkApi::VMObject *vm_object, const St
     }
 
     Object *owner = static_cast<Object *>(vm_object->userPtr);
-    if (korkscript_debug_types_enabled()) {
-        UtilityFunctions::print(vformat("[korkscript-prop] host.set_instance_field owner=%s field=%s type=%d value=%s",
-                owner != nullptr ? owner->get_class() : String("<null>"),
-                String(field),
-                static_cast<int64_t>(value.get_type()),
-                value));
-    }
     const std::string field_utf8 = intern_utf8(field);
     const bool is_script_class_field = get_script_class_field_info(vm_object, field, nullptr);
     const bool is_new_field = !is_script_class_field && find_dynamic_field_entry(get_dynamic_field_owner_key(vm_object), field_utf8) == nullptr;
@@ -1235,15 +1253,9 @@ bool KorkScriptVMHost::get_instance_field(KorkApi::VMObject *vm_object, const St
     }
 
     if (get_script_class_field_info(vm_object, field, nullptr)) {
+        ++const_cast<KorkScriptVMHost *>(this)->script_instance_field_read_depth_;
         value = get_vm_object_field_value(vm_object, field);
-        if (korkscript_debug_types_enabled()) {
-            Object *owner = static_cast<Object *>(vm_object->userPtr);
-            UtilityFunctions::print(vformat("[korkscript-prop] host.get_instance_field.script owner=%s field=%s type=%d value=%s",
-                    owner != nullptr ? owner->get_class() : String("<null>"),
-                    String(field),
-                    static_cast<int64_t>(value.get_type()),
-                    value));
-        }
+        --const_cast<KorkScriptVMHost *>(this)->script_instance_field_read_depth_;
         return true;
     }
 
@@ -1255,14 +1267,6 @@ bool KorkScriptVMHost::get_instance_field(KorkApi::VMObject *vm_object, const St
     }
 
     value = entry->value;
-    if (korkscript_debug_types_enabled()) {
-        Object *owner = static_cast<Object *>(vm_object->userPtr);
-        UtilityFunctions::print(vformat("[korkscript-prop] host.get_instance_field.dynamic owner=%s field=%s type=%d value=%s",
-                owner != nullptr ? owner->get_class() : String("<null>"),
-                String(field),
-                static_cast<int64_t>(value.get_type()),
-                value));
-    }
     return true;
 }
 
@@ -1377,18 +1381,40 @@ Variant KorkScriptVMHost::value_from_console_assignment_args(U32 argc, KorkApi::
 }
 
 bool KorkScriptVMHost::try_get_object_property(Object *owner, const StringName &property, Variant &value) const {
+    if (owner == nullptr) {
+        return false;
+    }
+
+    const uint64_t owner_id = owner->get_instance_id();
+    if (property_probe_owner_ids_.find(owner_id) != property_probe_owner_ids_.end()) {
+        return false;
+    }
+
     if (!has_godot_property(owner, property)) {
         return false;
     }
 
+    property_probe_owner_ids_.insert(owner_id);
     value = owner->get(property);
+    property_probe_owner_ids_.erase(owner_id);
     return true;
 }
 
 bool KorkScriptVMHost::try_set_object_property(Object *owner, const StringName &property, const Variant &value) const {
+    if (owner == nullptr) {
+        return false;
+    }
+
+    const uint64_t owner_id = owner->get_instance_id();
+    if (property_probe_owner_ids_.find(owner_id) != property_probe_owner_ids_.end()) {
+        return false;
+    }
+
+    property_probe_owner_ids_.insert(owner_id);
     owner->set(property, value);
 
     const Variant readback = owner->get(property);
+    property_probe_owner_ids_.erase(owner_id);
     if ((readback.get_type() != Variant::NIL || has_godot_property(owner, property)) && readback == value) {
         notify_owner_property_list_changed(owner);
         return true;
@@ -1717,6 +1743,7 @@ KorkApi::ConsoleValue KorkScriptVMHost::custom_field_get_by_name_callback(KorkAp
     Object *owner = static_cast<Object *>(object->userPtr);
     const StringName property_name(name);
     const DynamicFieldEntry *entry = self->find_dynamic_field_entry(self->get_dynamic_field_owner_key(object), std::string_view(name));
+    const bool is_script_instance_read = self->script_instance_field_read_depth_ > 0;
 
     if (self->is_current_execution_target(object)) {
         if (entry != nullptr) {
@@ -1726,14 +1753,14 @@ KorkApi::ConsoleValue KorkScriptVMHost::custom_field_get_by_name_callback(KorkAp
             return self->console_value_from_variant(self->get_vm_object_field_value(object, property_name));
         }
         Variant property_value;
-        if (self->try_get_object_property(owner, property_name, property_value)) {
+        if (!is_script_instance_read && self->try_get_object_property(owner, property_name, property_value)) {
             return self->console_value_from_variant(property_value);
         }
         return KorkApi::ConsoleValue();
     }
 
     Variant property_value;
-    if (self->try_get_object_property(owner, property_name, property_value)) {
+    if (!is_script_instance_read && self->try_get_object_property(owner, property_name, property_value)) {
         return self->console_value_from_variant(property_value);
     }
 
@@ -1753,16 +1780,6 @@ void KorkScriptVMHost::custom_field_set_by_name_callback(KorkApi::Vm *, KorkApi:
     Object *owner = static_cast<Object *>(object->userPtr);
     const StringName property_name(name);
     const Variant value = self->value_from_console_assignment_args(argc, argv);
-    if (korkscript_debug_types_enabled()) {
-        UtilityFunctions::print(vformat("[korkscript-prop] host.custom_field_set owner=%s field=%s argc=%d type=%d value=%s current=%d",
-                owner != nullptr ? owner->get_class() : String("<null>"),
-                String(property_name),
-                static_cast<int64_t>(argc),
-                static_cast<int64_t>(value.get_type()),
-                value,
-                self->is_current_execution_target(object) ? 1 : 0));
-    }
-
     const bool is_script_instance_write = self->script_instance_field_write_depth_ > 0;
     if (!self->is_current_execution_target(object) && !is_script_instance_write) {
         if (self->try_set_object_property(owner, property_name, value)) {
@@ -1941,6 +1958,68 @@ KorkApi::NamespaceId KorkScriptVMHost::ensure_namespace_for_class(const StringNa
     return current;
 }
 
+KorkApi::ClassId KorkScriptVMHost::ensure_class_for_godot_type(const StringName &class_name) {
+    if (vm_ == nullptr || class_name.is_empty()) {
+        return -1;
+    }
+
+    const std::string class_utf8 = intern_utf8(class_name);
+    auto found = godot_class_ids_by_name_.find(class_utf8);
+    if (found != godot_class_ids_by_name_.end()) {
+        return found->second;
+    }
+
+    if (!ClassDB::class_exists(class_name)) {
+        return -1;
+    }
+
+    KorkApi::ClassId parent_class_id = -1;
+    const StringName parent_name = ClassDBSingleton::get_singleton()->get_parent_class(class_name);
+    if (!parent_name.is_empty()) {
+        parent_class_id = ensure_class_for_godot_type(parent_name);
+    } else if (class_name == StringName("Object")) {
+        parent_class_id = godot_object_class_id_;
+    }
+
+    KorkApi::ClassInfo class_info{};
+    class_info.name = vm_->internString(class_utf8.c_str());
+    class_info.userPtr = this;
+    class_info.numFields = 0;
+    class_info.fields = &g_empty_field_info;
+    class_info.parentKlassId = parent_class_id;
+    class_info.nativeRootClassId = parent_class_id >= 0 ? parent_class_id : godot_object_class_id_;
+    class_info.iCreate = {
+        nullptr,
+        nullptr,
+        nullptr,
+        nullptr,
+        nullptr,
+        &KorkScriptVMHost::get_vm_object_id,
+        &KorkScriptVMHost::get_vm_object_name
+    };
+    class_info.iSignals = {
+        [](void *, KorkApi::VMObject *object, StringTableEntry signal_name, int argc, KorkApi::ConsoleValue *argv) {
+            if (object == nullptr || object->klass == nullptr || object->klass->userPtr == nullptr) {
+                return;
+            }
+
+            KorkScriptVMHost *self = static_cast<KorkScriptVMHost *>(object->klass->userPtr);
+            self->trigger_godot_signal(static_cast<Object *>(object->userPtr), signal_name, argc, argv);
+        }
+    };
+    class_info.iCustomFields = {
+        &KorkScriptVMHost::custom_field_iterate_callback,
+        &KorkScriptVMHost::custom_field_get_by_iterator_callback,
+        &KorkScriptVMHost::custom_field_get_by_name_callback,
+        &KorkScriptVMHost::custom_field_set_by_name_callback,
+        &KorkScriptVMHost::custom_field_set_type_callback
+    };
+
+    const KorkApi::ClassId class_id = vm_->registerClass(class_info);
+    godot_class_ids_by_name_.emplace(class_utf8, class_id);
+    return class_id;
+}
+
 void KorkScriptVMHost::install_object_bridge_methods(KorkApi::NamespaceId ns_id) {
     if (vm_ == nullptr || ns_id == nullptr) {
         return;
@@ -1978,7 +2057,14 @@ bool KorkScriptVMHost::has_godot_property(Object *owner, const StringName &prope
         return false;
     }
 
+    const uint64_t owner_id = owner->get_instance_id();
+    if (property_probe_owner_ids_.find(owner_id) != property_probe_owner_ids_.end()) {
+        return false;
+    }
+
+    property_probe_owner_ids_.insert(owner_id);
     const TypedArray<Dictionary> properties = owner->get_property_list();
+    property_probe_owner_ids_.erase(owner_id);
     for (int i = 0; i < properties.size(); ++i) {
         const Dictionary info = properties[i];
         if (StringName(info.get("name", Variant())) == property) {
@@ -2175,14 +2261,7 @@ KorkApi::ConsoleValue KorkScriptVMHost::bridge_object_get(Object *target, int32_
     }
     const StringName property_name(console_value_to_string(argv[2]));
     Variant value = target->get(property_name);
-    if (korkscript_debug_types_enabled()) {
-        UtilityFunctions::print(String("[korkscript-debug] get property='")
-                + String(property_name)
-                + "' variant_type=" + String::num_int64(value.get_type())
-                + " value='" + value.stringify() + "'");
-    }
     KorkApi::ConsoleValue out = console_value_from_variant(value);
-    debug_log_console_value("bridge_object_get.return", out);
     return out;
 }
 
@@ -2462,21 +2541,15 @@ KorkApi::ConsoleValue KorkScriptVMHost::console_value_from_variant(const Variant
     switch (value.get_type()) {
         case Variant::BOOL:
         {
-            KorkApi::ConsoleValue out = KorkApi::ConsoleValue::makeUnsigned(static_cast<bool>(value) ? 1 : 0);
-            debug_log_console_value("console_value_from_variant.bool", out);
-            return out;
+            return KorkApi::ConsoleValue::makeUnsigned(static_cast<bool>(value) ? 1 : 0);
         }
         case Variant::INT:
         {
-            KorkApi::ConsoleValue out = KorkApi::ConsoleValue::makeUnsigned(static_cast<uint64_t>(static_cast<int64_t>(value)));
-            debug_log_console_value("console_value_from_variant.int", out);
-            return out;
+            return KorkApi::ConsoleValue::makeUnsigned(static_cast<uint64_t>(static_cast<int64_t>(value)));
         }
         case Variant::FLOAT:
         {
-            KorkApi::ConsoleValue out = KorkApi::ConsoleValue::makeNumber(static_cast<double>(value));
-            debug_log_console_value("console_value_from_variant.float", out);
-            return out;
+            return KorkApi::ConsoleValue::makeNumber(static_cast<double>(value));
         }
         case Variant::VECTOR2: {
             KorkApi::ConsoleValue out = vm_->getTypeInZone(KorkApi::ConsoleValue::ZoneReturn, vector2_type_id_, sizeof(Vector2));
@@ -2484,7 +2557,6 @@ KorkApi::ConsoleValue KorkScriptVMHost::console_value_from_variant(const Variant
             if (dst != nullptr) {
                 *dst = static_cast<Vector2>(value);
             }
-            debug_log_console_value("console_value_from_variant.vector2", out);
             return out;
         }
         case Variant::VECTOR3: {
@@ -2493,7 +2565,6 @@ KorkApi::ConsoleValue KorkScriptVMHost::console_value_from_variant(const Variant
             if (dst != nullptr) {
                 *dst = static_cast<Vector3>(value);
             }
-            debug_log_console_value("console_value_from_variant.vector3", out);
             return out;
         }
         case Variant::VECTOR4: {
@@ -2502,7 +2573,6 @@ KorkApi::ConsoleValue KorkScriptVMHost::console_value_from_variant(const Variant
             if (dst != nullptr) {
                 *dst = static_cast<Vector4>(value);
             }
-            debug_log_console_value("console_value_from_variant.vector4", out);
             return out;
         }
         case Variant::COLOR: {
@@ -2511,14 +2581,11 @@ KorkApi::ConsoleValue KorkScriptVMHost::console_value_from_variant(const Variant
             if (dst != nullptr) {
                 *dst = static_cast<Color>(value);
             }
-            debug_log_console_value("console_value_from_variant.color", out);
             return out;
         }
         case Variant::NIL:
         {
-            KorkApi::ConsoleValue out;
-            debug_log_console_value("console_value_from_variant.nil", out);
-            return out;
+            return KorkApi::ConsoleValue();
         }
         default: {
             const CharString utf8 = value.stringify().utf8();
@@ -2527,7 +2594,6 @@ KorkApi::ConsoleValue KorkScriptVMHost::console_value_from_variant(const Variant
             if (out != nullptr) {
                 std::memcpy(out, utf8.get_data(), static_cast<size_t>(utf8.length() + 1));
             }
-            debug_log_console_value("console_value_from_variant.stringish", buffer);
             return buffer;
         }
     }
@@ -2547,7 +2613,6 @@ KorkApi::ConsoleValue KorkScriptVMHost::console_value_from_variant_for_call(cons
             if (dst != nullptr) {
                 *dst = static_cast<Vector2>(value);
             }
-            debug_log_console_value("console_value_from_variant_for_call.vector2", out);
             return out;
         }
         case Variant::VECTOR3: {
@@ -2556,7 +2621,6 @@ KorkApi::ConsoleValue KorkScriptVMHost::console_value_from_variant_for_call(cons
             if (dst != nullptr) {
                 *dst = static_cast<Vector3>(value);
             }
-            debug_log_console_value("console_value_from_variant_for_call.vector3", out);
             return out;
         }
         case Variant::VECTOR4: {
@@ -2565,7 +2629,6 @@ KorkApi::ConsoleValue KorkScriptVMHost::console_value_from_variant_for_call(cons
             if (dst != nullptr) {
                 *dst = static_cast<Vector4>(value);
             }
-            debug_log_console_value("console_value_from_variant_for_call.vector4", out);
             return out;
         }
         case Variant::COLOR: {
@@ -2574,7 +2637,6 @@ KorkApi::ConsoleValue KorkScriptVMHost::console_value_from_variant_for_call(cons
             if (dst != nullptr) {
                 *dst = static_cast<Color>(value);
             }
-            debug_log_console_value("console_value_from_variant_for_call.color", out);
             return out;
         }
         case Variant::NIL:
@@ -2586,7 +2648,6 @@ KorkApi::ConsoleValue KorkScriptVMHost::console_value_from_variant_for_call(cons
             if (out != nullptr) {
                 std::memcpy(out, utf8.get_data(), static_cast<size_t>(utf8.length() + 1));
             }
-            debug_log_console_value("console_value_from_variant_for_call.stringish", buffer);
             return buffer;
         }
     }

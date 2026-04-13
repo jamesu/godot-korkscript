@@ -101,6 +101,7 @@ private:
     bool reload_known_scripts(const KorkScript *extra_script = nullptr);
     void ensure_global_math_namespace();
     KorkApi::NamespaceId ensure_namespace_for_class(const StringName &class_name);
+    KorkApi::ClassId ensure_class_for_godot_type(const StringName &class_name);
     void install_object_bridge_methods(KorkApi::NamespaceId ns_id);
     void ensure_object_bridge_namespace();
     bool has_godot_property(Object *owner, const StringName &property) const;
@@ -181,6 +182,7 @@ private:
     std::unordered_map<KorkApi::SimObjectId, KorkApi::VMObject *> vm_objects_by_id_;
     std::unordered_map<std::string, KorkApi::VMObject *> vm_objects_by_name_;
     std::unordered_map<std::string, KorkApi::VMObject *> vm_objects_by_path_;
+    std::unordered_map<std::string, KorkApi::ClassId> godot_class_ids_by_name_;
     std::unordered_map<uint64_t, DynamicFieldState> dynamic_fields_by_owner_id_;
     std::unordered_map<uint64_t, ActiveScriptState> active_scripts_;
     std::unordered_map<uint64_t, const KorkScript *> known_scripts_;
@@ -190,7 +192,9 @@ private:
     uint64_t generation_;
     bool reload_pending_;
     int script_instance_field_write_depth_;
+    int script_instance_field_read_depth_;
     mutable std::vector<uint64_t> execution_target_stack_;
+    mutable std::unordered_set<uint64_t> property_probe_owner_ids_;
 };
 
 } // namespace godot
