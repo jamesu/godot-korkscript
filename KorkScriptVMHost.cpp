@@ -2724,6 +2724,13 @@ KorkApi::ConsoleValue KorkScriptVMHost::console_value_from_variant_for_call(cons
             }
             return out;
         }
+        case Variant::OBJECT: {
+            Object *object = value.operator Object *();
+            if (object != nullptr) {
+                return KorkApi::ConsoleValue::makeUnsigned(ensure_sim_object_id(object));
+            }
+            return KorkApi::ConsoleValue();
+        }
         case Variant::NIL:
             return KorkApi::ConsoleValue();
         default: {
@@ -2791,6 +2798,7 @@ Variant KorkScriptVMHost::parse_script_argument(KorkApi::ConsoleValue value) con
     }
     return text;
 }
+
 
 String KorkScriptVMHost::console_value_to_string(KorkApi::ConsoleValue value) const {
     const char *str = vm_->valueAsString(value);
