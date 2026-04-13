@@ -18,6 +18,192 @@ namespace godot {
 
 namespace {
 
+std::string string_name_key(const StringName &name);
+
+String strip_script_comments(const String &source) {
+    String out;
+
+    bool in_string = false;
+    bool in_line_comment = false;
+    bool in_block_comment = false;
+
+    for (int i = 0; i < source.length(); ++i) {
+        const char32_t c = source[i];
+        const char32_t next = i + 1 < source.length() ? source[i + 1] : 0;
+
+        if (in_line_comment) {
+            if (c == '\n') {
+                in_line_comment = false;
+                out += String::chr(c);
+            }
+            continue;
+        }
+
+        if (in_block_comment) {
+            if (c == '*' && next == '/') {
+                in_block_comment = false;
+                ++i;
+            }
+            continue;
+        }
+
+        if (!in_string && c == '/' && next == '/') {
+            in_line_comment = true;
+            ++i;
+            continue;
+        }
+
+        if (!in_string && c == '/' && next == '*') {
+            in_block_comment = true;
+            ++i;
+            continue;
+        }
+
+        if (c == '"' && (i == 0 || source[i - 1] != '\\')) {
+            in_string = !in_string;
+        }
+
+        out += String::chr(c);
+    }
+
+    return out;
+}
+
+Variant::Type parse_class_field_variant_type(const String &type_name) {
+    const String type = type_name.strip_edges();
+    if (type == "bool" || type == "Bool") {
+        return Variant::BOOL;
+    }
+    if (type == "int" || type == "Int") {
+        return Variant::INT;
+    }
+    if (type == "float") {
+        return Variant::FLOAT;
+    }
+    if (type == "uint") {
+        return Variant::INT;
+    }
+    if (type == "string") {
+        return Variant::STRING;
+    }
+    if (type == "Vector2") {
+        return Variant::VECTOR2;
+    }
+    if (type == "Vector3") {
+        return Variant::VECTOR3;
+    }
+    if (type == "Vector4") {
+        return Variant::VECTOR4;
+    }
+    if (type == "Color") {
+        return Variant::COLOR;
+    }
+    return Variant::NIL;
+}
+
+Variant parse_class_field_default_value(const String &value_text, Variant::Type type, bool *r_ok = nullptr) {
+    if (r_ok != nullptr) {
+        *r_ok = false;
+    }
+
+    const String text = value_text.strip_edges();
+    if (text.is_empty()) {
+        return Variant();
+    }
+
+    switch (type) {
+        case Variant::BOOL:
+            if (text == "true" || text == "1") {
+                if (r_ok != nullptr) {
+                    *r_ok = true;
+                }
+                return true;
+            }
+            if (text == "false" || text == "0") {
+                if (r_ok != nullptr) {
+                    *r_ok = true;
+                }
+                return false;
+            }
+            return Variant();
+        case Variant::FLOAT:
+            if (r_ok != nullptr) {
+                *r_ok = true;
+            }
+            return text.to_float();
+        case Variant::INT:
+            if (r_ok != nullptr) {
+                *r_ok = true;
+            }
+            return static_cast<int64_t>(text.to_int());
+        case Variant::STRING:
+            if (text.length() >= 2 && text.begins_with("\"") && text.ends_with("\"")) {
+                if (r_ok != nullptr) {
+                    *r_ok = true;
+                }
+                return text.substr(1, text.length() - 2);
+            }
+            return Variant();
+        default:
+            return Variant();
+    }
+}
+
+void parse_script_class_fields(const String &source_code,
+        std::unordered_map<std::string, KorkScript::ClassFieldMetadata> &out_metadata,
+        std::vector<std::string> &out_order) {
+    out_metadata.clear();
+    out_order.clear();
+
+    const String sanitized_source = strip_script_comments(source_code);
+    const int class_pos = sanitized_source.find("class ");
+    if (class_pos < 0) {
+        return;
+    }
+
+    const int open_brace = sanitized_source.find("{", class_pos);
+    const int close_brace = open_brace >= 0 ? sanitized_source.find("};", open_brace) : -1;
+    if (open_brace < 0 || close_brace < 0 || close_brace <= open_brace) {
+        return;
+    }
+
+    const String body = sanitized_source.substr(open_brace + 1, close_brace - (open_brace + 1));
+    PackedStringArray declarations = body.split(";", false);
+    for (int i = 0; i < declarations.size(); ++i) {
+        const String declaration = declarations[i].strip_edges();
+        if (declaration.is_empty()) {
+            continue;
+        }
+
+        const int colon_pos = declaration.find(":");
+        if (colon_pos <= 0) {
+            continue;
+        }
+
+        const String field_name = declaration.substr(0, colon_pos).strip_edges();
+        const String remainder = declaration.substr(colon_pos + 1).strip_edges();
+        const int equals_pos = remainder.find("=");
+        const String type_name = (equals_pos >= 0 ? remainder.substr(0, equals_pos) : remainder).strip_edges();
+        const String default_text = equals_pos >= 0 ? remainder.substr(equals_pos + 1).strip_edges() : String();
+        if (field_name.is_empty() || type_name.is_empty()) {
+            continue;
+        }
+
+        KorkScript::ClassFieldMetadata metadata;
+        metadata.name = StringName(field_name);
+        metadata.type = parse_class_field_variant_type(type_name);
+        bool has_default = false;
+        metadata.default_value = parse_class_field_default_value(default_text, metadata.type, &has_default);
+        metadata.has_default = has_default;
+
+        const std::string key = string_name_key(StringName(field_name));
+        if (out_metadata.find(key) == out_metadata.end()) {
+            out_order.push_back(key);
+        }
+        out_metadata[key] = metadata;
+    }
+}
+
 struct KorkScriptInstance {
     Object *owner = nullptr;
     Ref<KorkScript> script;
@@ -207,12 +393,33 @@ void instance_free_property_list(GDExtensionScriptInstanceDataPtr, const GDExten
     g_script_property_lists.erase(found);
 }
 
-GDExtensionBool instance_property_can_revert(GDExtensionScriptInstanceDataPtr, GDExtensionConstStringNamePtr) {
-    return false;
+GDExtensionBool instance_property_can_revert(GDExtensionScriptInstanceDataPtr p_instance, GDExtensionConstStringNamePtr p_name) {
+    KorkScriptInstance *instance = static_cast<KorkScriptInstance *>(p_instance);
+    if (instance == nullptr || !instance->script.is_valid()) {
+        return false;
+    }
+
+    const StringName &name = *reinterpret_cast<const StringName *>(p_name);
+    if (owner_has_godot_property(instance, name)) {
+        return false;
+    }
+
+    return instance->script->_has_property_default_value(name);
 }
 
-GDExtensionBool instance_property_get_revert(GDExtensionScriptInstanceDataPtr, GDExtensionConstStringNamePtr, GDExtensionVariantPtr) {
-    return false;
+GDExtensionBool instance_property_get_revert(GDExtensionScriptInstanceDataPtr p_instance, GDExtensionConstStringNamePtr p_name, GDExtensionVariantPtr r_ret) {
+    KorkScriptInstance *instance = static_cast<KorkScriptInstance *>(p_instance);
+    if (instance == nullptr || !instance->script.is_valid()) {
+        return false;
+    }
+
+    const StringName &name = *reinterpret_cast<const StringName *>(p_name);
+    if (owner_has_godot_property(instance, name) || !instance->script->_has_property_default_value(name)) {
+        return false;
+    }
+
+    *reinterpret_cast<Variant *>(r_ret) = instance->script->_get_property_default_value(name);
+    return true;
 }
 
 GDExtensionObjectPtr instance_get_owner(GDExtensionScriptInstanceDataPtr p_instance) {
@@ -657,6 +864,51 @@ bool KorkScript::is_tool_enabled() const {
     return _is_tool();
 }
 
+bool KorkScript::has_class_field(const StringName &field) const {
+    return get_class_field_metadata(field) != nullptr;
+}
+
+Variant::Type KorkScript::get_class_field_type(const StringName &field, bool *r_exists) const {
+    const ClassFieldMetadata *metadata = get_class_field_metadata(field);
+    if (r_exists != nullptr) {
+        *r_exists = metadata != nullptr;
+    }
+    return metadata != nullptr ? metadata->type : Variant::NIL;
+}
+
+bool KorkScript::get_class_field_default_value(const StringName &field, Variant *r_value) const {
+    const ClassFieldMetadata *metadata = get_class_field_metadata(field);
+    if (metadata == nullptr || !metadata->has_default) {
+        return false;
+    }
+    if (r_value != nullptr) {
+        *r_value = metadata->default_value;
+    }
+    return true;
+}
+
+bool KorkScript::get_previous_class_field_default_value(const StringName &field, Variant *r_value) const {
+    const ClassFieldMetadata *metadata = get_previous_class_field_metadata(field);
+    if (metadata == nullptr || !metadata->has_default) {
+        return false;
+    }
+    if (r_value != nullptr) {
+        *r_value = metadata->default_value;
+    }
+    return true;
+}
+
+PackedStringArray KorkScript::get_class_field_names() const {
+    PackedStringArray out;
+    for (const std::string &field_name : class_field_order_) {
+        const auto found = class_field_metadata_.find(field_name);
+        if (found != class_field_metadata_.end()) {
+            out.push_back(String(found->second.name));
+        }
+    }
+    return out;
+}
+
 bool KorkScript::_editor_can_reload_from_file() {
     return true;
 }
@@ -720,9 +972,13 @@ void KorkScript::_set_source_code(const String &p_code) {
 }
 
 Error KorkScript::_reload(bool) {
+    KorkScriptLanguage *language = KorkScriptLanguage::get_singleton();
+    KorkScriptVMHost *host = language != nullptr ? language->get_vm_host(vm_name_) : nullptr;
     ++revision_;
     refresh_method_cache();
-    KorkScriptLanguage *language = KorkScriptLanguage::get_singleton();
+    if (host != nullptr) {
+        host->refresh_script_class_defaults(this);
+    }
     if (language != nullptr) {
         language->notify_script_changed(this);
     }
@@ -837,12 +1093,17 @@ TypedArray<Dictionary> KorkScript::_get_script_signal_list() const {
     return host != nullptr ? host->get_script_signal_list(this) : TypedArray<Dictionary>();
 }
 
-bool KorkScript::_has_property_default_value(const StringName &) const {
-    return false;
+bool KorkScript::_has_property_default_value(const StringName &p_property) const {
+    const ClassFieldMetadata *metadata = get_class_field_metadata(p_property);
+    return metadata != nullptr && metadata->has_default;
 }
 
-Variant KorkScript::_get_property_default_value(const StringName &) const {
-    return Variant();
+Variant KorkScript::_get_property_default_value(const StringName &p_property) const {
+    const ClassFieldMetadata *metadata = get_class_field_metadata(p_property);
+    if (metadata == nullptr || !metadata->has_default) {
+        return Variant();
+    }
+    return metadata->default_value;
 }
 
 void KorkScript::_update_exports() {
@@ -889,7 +1150,22 @@ TypedArray<Dictionary> KorkScript::_get_script_method_list() const {
 }
 
 TypedArray<Dictionary> KorkScript::_get_script_property_list() const {
-    return TypedArray<Dictionary>();
+    TypedArray<Dictionary> out;
+    for (const std::string &field_name : class_field_order_) {
+        const auto found = class_field_metadata_.find(field_name);
+        if (found == class_field_metadata_.end()) {
+            continue;
+        }
+
+        Dictionary prop;
+        prop["name"] = String(found->second.name);
+        prop["type"] = static_cast<int64_t>(found->second.type);
+        prop["hint"] = static_cast<int64_t>(PROPERTY_HINT_NONE);
+        prop["hint_string"] = String();
+        prop["usage"] = static_cast<int64_t>(PROPERTY_USAGE_DEFAULT | PROPERTY_USAGE_SCRIPT_VARIABLE);
+        out.push_back(prop);
+    }
+    return out;
 }
 
 int32_t KorkScript::_get_member_line(const StringName &p_member) const {
@@ -960,9 +1236,12 @@ void KorkScript::_bind_methods() {
 }
 
 void KorkScript::refresh_method_cache() {
+    previous_class_field_metadata_ = class_field_metadata_;
     method_names_.clear();
     method_metadata_.clear();
     method_order_.clear();
+    class_field_metadata_.clear();
+    class_field_order_.clear();
     inferred_namespace_name_ = String();
 
     const String inferred_class_name = infer_class_name_from_code(source_code_);
@@ -1017,11 +1296,23 @@ void KorkScript::refresh_method_cache() {
     if (inferred_namespace_name_.is_empty()) {
         inferred_namespace_name_ = infer_namespace_from_signal_decls(source_code_);
     }
+
+    parse_script_class_fields(source_code_, class_field_metadata_, class_field_order_);
 }
 
 const KorkScript::MethodMetadata *KorkScript::get_method_metadata(const StringName &method) const {
     const auto found = method_metadata_.find(string_name_key(method));
     return found != method_metadata_.end() ? &found->second : nullptr;
+}
+
+const KorkScript::ClassFieldMetadata *KorkScript::get_class_field_metadata(const StringName &field) const {
+    const auto found = class_field_metadata_.find(string_name_key(field));
+    return found != class_field_metadata_.end() ? &found->second : nullptr;
+}
+
+const KorkScript::ClassFieldMetadata *KorkScript::get_previous_class_field_metadata(const StringName &field) const {
+    const auto found = previous_class_field_metadata_.find(string_name_key(field));
+    return found != previous_class_field_metadata_.end() ? &found->second : nullptr;
 }
 
 } // namespace godot

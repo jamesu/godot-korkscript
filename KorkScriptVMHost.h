@@ -50,6 +50,7 @@ public:
     bool get_instance_field(KorkApi::VMObject *vm_object, const StringName &field, Variant &value) const;
     Variant::Type get_instance_field_type(KorkApi::VMObject *vm_object, const StringName &field, bool *r_exists = nullptr) const;
     TypedArray<Dictionary> get_instance_field_list(KorkApi::VMObject *vm_object) const;
+    void refresh_script_class_defaults(const KorkScript *script);
     void add_instance_property_state(KorkApi::VMObject *vm_object, GDExtensionScriptInstancePropertyStateAdd add_func, void *userdata) const;
     bool is_current_execution_target(KorkApi::VMObject *vm_object) const;
 
@@ -94,6 +95,7 @@ private:
     static KorkApi::ConsoleValue object_get_parent_callback(void *obj, void *user_ptr, int32_t argc, KorkApi::ConsoleValue argv[]);
     static KorkApi::ConsoleValue object_get_object_callback(void *obj, void *user_ptr, int32_t argc, KorkApi::ConsoleValue argv[]);
     static KorkApi::ConsoleValue object_get_count_callback(void *obj, void *user_ptr, int32_t argc, KorkApi::ConsoleValue argv[]);
+    static KorkApi::ConsoleValue object_kork_ctor_callback(void *obj, void *user_ptr, int32_t argc, KorkApi::ConsoleValue argv[]);
 
     void initialize_vm();
     void reset_vm();
@@ -102,10 +104,13 @@ private:
     void ensure_global_math_namespace();
     KorkApi::NamespaceId ensure_namespace_for_class(const StringName &class_name);
     KorkApi::ClassId ensure_class_for_godot_type(const StringName &class_name);
-    void install_object_bridge_methods(KorkApi::NamespaceId ns_id);
+    void install_object_bridge_methods(KorkApi::NamespaceId ns_id, bool include_script_ctor = false);
     void ensure_object_bridge_namespace();
     bool has_godot_property(Object *owner, const StringName &property) const;
     void notify_owner_property_list_changed(Object *owner) const;
+    void seed_script_class_defaults(Object *owner, KorkApi::VMObject *vm_object, const KorkScript *script);
+    bool get_declared_script_default(Object *owner, const StringName &field, Variant &value) const;
+    bool has_declared_script_field(Object *owner, const StringName &field, Variant::Type *r_type = nullptr) const;
     void push_execution_target(uint64_t owner_key) const;
     void pop_execution_target() const;
     Variant value_from_console_assignment_args(U32 argc, KorkApi::ConsoleValue *argv) const;

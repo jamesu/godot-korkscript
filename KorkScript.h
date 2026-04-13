@@ -32,6 +32,11 @@ public:
     uint64_t get_revision() const;
     bool has_method_name(const StringName &method) const;
     bool is_tool_enabled() const;
+    bool has_class_field(const StringName &field) const;
+    Variant::Type get_class_field_type(const StringName &field, bool *r_exists = nullptr) const;
+    bool get_class_field_default_value(const StringName &field, Variant *r_value = nullptr) const;
+    bool get_previous_class_field_default_value(const StringName &field, Variant *r_value = nullptr) const;
+    PackedStringArray get_class_field_names() const;
 
     bool _editor_can_reload_from_file() override;
     bool _can_instantiate() const override;
@@ -81,9 +86,18 @@ public:
         int32_t line = -1;
     };
 
+    struct ClassFieldMetadata {
+        StringName name;
+        Variant::Type type = Variant::NIL;
+        Variant default_value;
+        bool has_default = false;
+    };
+
 private:
     void refresh_method_cache();
     const MethodMetadata *get_method_metadata(const StringName &method) const;
+    const ClassFieldMetadata *get_class_field_metadata(const StringName &field) const;
+    const ClassFieldMetadata *get_previous_class_field_metadata(const StringName &field) const;
 
     String source_code_;
     String vm_name_;
@@ -95,6 +109,9 @@ private:
     std::unordered_set<std::string> method_names_;
     std::unordered_map<std::string, MethodMetadata> method_metadata_;
     std::vector<std::string> method_order_;
+    std::unordered_map<std::string, ClassFieldMetadata> class_field_metadata_;
+    std::vector<std::string> class_field_order_;
+    std::unordered_map<std::string, ClassFieldMetadata> previous_class_field_metadata_;
 };
 
 } // namespace godot
