@@ -616,9 +616,61 @@ struct AstScriptMetadata {
     std::unordered_set<std::string> method_names;
     std::unordered_map<std::string, KorkScript::MethodMetadata> method_metadata;
     std::vector<std::string> method_order;
+    std::unordered_set<std::string> signal_names;
+    std::unordered_map<std::string, KorkScript::SignalMetadata> signal_metadata;
+    std::vector<std::string> signal_order;
     std::unordered_map<std::string, KorkScript::ClassFieldMetadata> class_field_metadata;
     std::vector<std::string> class_field_order;
 };
+
+bool stmt_list_contains_return(const StmtNode *node) {
+    for (const StmtNode *it = node; it != nullptr; it = it->getNext()) {
+        if (it->getASTNodeType() == ASTNodeReturnStmt) {
+            return true;
+        }
+
+        switch (it->getASTNodeType()) {
+            case ASTNodeIfStmt: {
+                const IfStmtNode *if_node = static_cast<const IfStmtNode *>(it);
+                if (stmt_list_contains_return(if_node->ifBlock) || stmt_list_contains_return(if_node->elseBlock)) {
+                    return true;
+                }
+                break;
+            }
+            case ASTNodeLoopStmt: {
+                const LoopStmtNode *loop_node = static_cast<const LoopStmtNode *>(it);
+                if (stmt_list_contains_return(loop_node->loopBlock)) {
+                    return true;
+                }
+                break;
+            }
+            case ASTNodeIterStmt: {
+                const IterStmtNode *iter_node = static_cast<const IterStmtNode *>(it);
+                if (stmt_list_contains_return(iter_node->body)) {
+                    return true;
+                }
+                break;
+            }
+            case ASTNodeTryStmt: {
+                const TryStmtNode *try_node = static_cast<const TryStmtNode *>(it);
+                if (stmt_list_contains_return(try_node->tryBlock) || stmt_list_contains_return(try_node->catchBlocks)) {
+                    return true;
+                }
+                break;
+            }
+            case ASTNodeCatchStmt: {
+                const CatchStmtNode *catch_node = static_cast<const CatchStmtNode *>(it);
+                if (stmt_list_contains_return(catch_node->catchBlock)) {
+                    return true;
+                }
+                break;
+            }
+            default:
+                break;
+        }
+    }
+    return false;
+}
 
 KorkApi::AstEnumerationControl collect_script_metadata_from_ast(void *user_ptr, const KorkApi::AstEnumerationInfo *info) {
     if (user_ptr == nullptr || info == nullptr) {
@@ -646,16 +698,34 @@ KorkApi::AstEnumerationControl collect_script_metadata_from_ast(void *user_ptr, 
                     out->inferred_namespace_name = namespace_name;
                 }
 
-                if (function_node->isSignal) {
-                    break;
-                }
-
                 const String method_name = String(function_node->fnName).strip_edges();
                 if (method_name.is_empty()) {
                     break;
                 }
 
                 const std::string method_key = string_name_key(StringName(method_name));
+                if (function_node->isSignal) {
+                    out->signal_names.insert(method_key);
+                    if (out->signal_metadata.find(method_key) == out->signal_metadata.end()) {
+                        out->signal_order.push_back(method_key);
+                    }
+
+                    KorkScript::SignalMetadata metadata;
+                    for (const VarNode *arg = function_node->args; arg != nullptr; arg = static_cast<const VarNode *>(arg->getNext())) {
+                        KorkScript::MethodArgumentMetadata argument_metadata = parse_method_argument(arg);
+                        if (argument_metadata.name.is_empty()) {
+                            continue;
+                        }
+                        if (metadata.arguments.empty() && argument_metadata.name == StringName("this")) {
+                            continue;
+                        }
+                        metadata.arguments.push_back(argument_metadata);
+                    }
+                    metadata.line = function_node->dbgLineNumber > 0 ? function_node->dbgLineNumber : -1;
+                    out->signal_metadata[method_key] = metadata;
+                    break;
+                }
+
                 out->method_names.insert(method_key);
                 if (out->method_metadata.find(method_key) == out->method_metadata.end()) {
                     out->method_order.push_back(method_key);
@@ -672,6 +742,11 @@ KorkApi::AstEnumerationControl collect_script_metadata_from_ast(void *user_ptr, 
                     }
                     metadata.arguments.push_back(argument_metadata);
                 }
+                metadata.return_type = variant_type_from_name(String(function_node->returnTypeName).strip_edges());
+                if (metadata.return_type == Variant::NIL && function_node->returnTypeName != nullptr && String(function_node->returnTypeName).strip_edges() != String()) {
+                    metadata.return_class_name = StringName(String(function_node->returnTypeName).strip_edges());
+                }
+                metadata.has_return_value = function_node->returnTypeName != nullptr || stmt_list_contains_return(function_node->stmts);
                 metadata.line = function_node->dbgLineNumber > 0 ? function_node->dbgLineNumber : -1;
                 out->method_metadata[method_key] = metadata;
                 break;
@@ -971,6 +1046,9 @@ Dictionary KorkScript::_get_method_info(const StringName &p_method) const {
     }
 
     MethodInfo method_info(p_method);
+    if (metadata->has_return_value) {
+        method_info.return_val = PropertyInfo(metadata->return_type, String(), PROPERTY_HINT_NONE, String(metadata->return_class_name));
+    }
     for (const MethodArgumentMetadata &argument : metadata->arguments) {
         PropertyInfo property_info(argument.type, String(argument.name), PROPERTY_HINT_NONE, String(argument.class_name));
         method_info.arguments.push_back(property_info);
@@ -995,6 +1073,10 @@ ScriptLanguage *KorkScript::_get_language() const {
 }
 
 bool KorkScript::_has_script_signal(const StringName &p_signal) const {
+    if (get_signal_metadata(p_signal) != nullptr) {
+        return true;
+    }
+
     KorkScriptLanguage *language = KorkScriptLanguage::get_singleton();
     if (language == nullptr) {
         return false;
@@ -1005,13 +1087,58 @@ bool KorkScript::_has_script_signal(const StringName &p_signal) const {
 }
 
 TypedArray<Dictionary> KorkScript::_get_script_signal_list() const {
+    TypedArray<Dictionary> out;
+    std::unordered_set<std::string> seen_signals;
+    for (const std::string &signal_name : signal_order_) {
+        const auto found = signal_metadata_.find(signal_name);
+        if (found == signal_metadata_.end()) {
+            continue;
+        }
+
+        Dictionary signal_info;
+        signal_info["name"] = String(signal_name.c_str());
+        Array args;
+        for (const MethodArgumentMetadata &argument : found->second.arguments) {
+            Dictionary arg_info;
+            arg_info["name"] = String(argument.name);
+            arg_info["type"] = static_cast<int64_t>(argument.type);
+            if (!argument.class_name.is_empty()) {
+                arg_info["class_name"] = String(argument.class_name);
+            }
+            args.push_back(arg_info);
+        }
+        signal_info["args"] = args;
+        signal_info["default_args"] = Array();
+        out.push_back(signal_info);
+        seen_signals.insert(signal_name);
+    }
+
     KorkScriptLanguage *language = KorkScriptLanguage::get_singleton();
     if (language == nullptr) {
-        return TypedArray<Dictionary>();
+        return out;
     }
 
     KorkScriptVMHost *host = language->get_vm_host(vm_name_);
-    return host != nullptr ? host->get_script_signal_list(this) : TypedArray<Dictionary>();
+    if (host == nullptr) {
+        return out;
+    }
+
+    const TypedArray<Dictionary> host_signals = host->get_script_signal_list(this);
+    for (int i = 0; i < host_signals.size(); ++i) {
+        const Dictionary signal_info = host_signals[i];
+        const String signal_name = signal_info.get("name", "");
+        if (signal_name.is_empty()) {
+            continue;
+        }
+
+        const std::string key = string_name_key(StringName(signal_name));
+        if (!seen_signals.insert(key).second) {
+            continue;
+        }
+        out.push_back(signal_info);
+    }
+
+    return out;
 }
 
 bool KorkScript::_has_property_default_value(const StringName &p_property) const {
@@ -1161,6 +1288,9 @@ void KorkScript::refresh_method_cache() {
     method_names_.clear();
     method_metadata_.clear();
     method_order_.clear();
+    signal_names_.clear();
+    signal_metadata_.clear();
+    signal_order_.clear();
     class_field_metadata_.clear();
     class_field_order_.clear();
     inferred_namespace_name_ = String();
@@ -1176,6 +1306,9 @@ void KorkScript::refresh_method_cache() {
     method_names_ = std::move(metadata.method_names);
     method_metadata_ = std::move(metadata.method_metadata);
     method_order_ = std::move(metadata.method_order);
+    signal_names_ = std::move(metadata.signal_names);
+    signal_metadata_ = std::move(metadata.signal_metadata);
+    signal_order_ = std::move(metadata.signal_order);
     class_field_metadata_ = std::move(metadata.class_field_metadata);
     class_field_order_ = std::move(metadata.class_field_order);
 }
@@ -1183,6 +1316,11 @@ void KorkScript::refresh_method_cache() {
 const KorkScript::MethodMetadata *KorkScript::get_method_metadata(const StringName &method) const {
     const auto found = method_metadata_.find(string_name_key(method));
     return found != method_metadata_.end() ? &found->second : nullptr;
+}
+
+const KorkScript::SignalMetadata *KorkScript::get_signal_metadata(const StringName &signal) const {
+    const auto found = signal_metadata_.find(string_name_key(signal));
+    return found != signal_metadata_.end() ? &found->second : nullptr;
 }
 
 const KorkScript::ClassFieldMetadata *KorkScript::get_class_field_metadata(const StringName &field) const {

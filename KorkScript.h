@@ -83,6 +83,14 @@ public:
 
     struct MethodMetadata {
         std::vector<MethodArgumentMetadata> arguments;
+        Variant::Type return_type = Variant::NIL;
+        StringName return_class_name;
+        bool has_return_value = false;
+        int32_t line = -1;
+    };
+
+    struct SignalMetadata {
+        std::vector<MethodArgumentMetadata> arguments;
         int32_t line = -1;
     };
 
@@ -96,6 +104,7 @@ public:
 private:
     void refresh_method_cache();
     const MethodMetadata *get_method_metadata(const StringName &method) const;
+    const SignalMetadata *get_signal_metadata(const StringName &signal) const;
     const ClassFieldMetadata *get_class_field_metadata(const StringName &field) const;
     const ClassFieldMetadata *get_previous_class_field_metadata(const StringName &field) const;
 
@@ -109,6 +118,9 @@ private:
     std::unordered_set<std::string> method_names_;
     std::unordered_map<std::string, MethodMetadata> method_metadata_;
     std::vector<std::string> method_order_;
+    std::unordered_set<std::string> signal_names_;
+    std::unordered_map<std::string, SignalMetadata> signal_metadata_;
+    std::vector<std::string> signal_order_;
     std::unordered_map<std::string, ClassFieldMetadata> class_field_metadata_;
     std::vector<std::string> class_field_order_;
     std::unordered_map<std::string, ClassFieldMetadata> previous_class_field_metadata_;
