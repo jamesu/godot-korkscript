@@ -45,6 +45,7 @@ public:
     String _get_source_code() const override;
     void _set_source_code(const String &p_code) override;
     Error _reload(bool p_keep_state) override;
+    StringName _get_doc_class_name() const override;
     TypedArray<Dictionary> _get_documentation() const override;
     bool _has_method(const StringName &p_method) const override;
     bool _has_static_method(const StringName &p_method) const override;
@@ -62,6 +63,7 @@ public:
     TypedArray<Dictionary> _get_script_method_list() const override;
     TypedArray<Dictionary> _get_script_property_list() const override;
     int32_t _get_member_line(const StringName &p_member) const override;
+    Dictionary _get_constants() const override;
     TypedArray<StringName> _get_members() const override;
 
 protected:

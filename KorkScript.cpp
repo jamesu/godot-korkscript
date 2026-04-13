@@ -11,6 +11,8 @@
 #include <godot_cpp/core/memory.hpp>
 #include <godot_cpp/core/object.hpp>
 
+#include <cstdlib>
+#include <cstring>
 #include <unordered_map>
 #include <vector>
 
@@ -36,6 +38,36 @@ struct ScriptPropertyListAllocation {
 };
 
 std::unordered_map<const GDExtensionPropertyInfo *, ScriptPropertyListAllocation> g_script_property_lists;
+
+bool korkscript_debug_properties_enabled() {
+    static const bool enabled = []() {
+        const char *value = std::getenv("KORKSCRIPT_DEBUG_PROPERTIES");
+        return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
+    }();
+    return enabled;
+}
+
+void log_property_debug(const KorkScriptInstance *instance, const char *stage, const StringName &property_name, const Variant *value = nullptr) {
+    if (!korkscript_debug_properties_enabled()) {
+        return;
+    }
+
+    const String owner_name = instance != nullptr && instance->owner != nullptr ? instance->owner->get_class() : String("<null>");
+    const String property_text = String(property_name);
+    if (value != nullptr) {
+        UtilityFunctions::print(vformat("[korkscript-prop] %s owner=%s property=%s type=%d value=%s",
+                String(stage),
+                owner_name,
+                property_text,
+                static_cast<int64_t>(value->get_type()),
+                *value));
+    } else {
+        UtilityFunctions::print(vformat("[korkscript-prop] %s owner=%s property=%s",
+                String(stage),
+                owner_name,
+                property_text));
+    }
+}
 
 bool is_editor_lifecycle_method(const StringName &name) {
     return name == StringName("_ready") ||
@@ -126,7 +158,15 @@ GDExtensionBool instance_set(GDExtensionScriptInstanceDataPtr p_instance, GDExte
     }
 
     const Variant &value = *reinterpret_cast<const Variant *>(p_value);
-    return instance->host->set_instance_field(instance->vm_object, name, value);
+    log_property_debug(instance, "instance_set.begin", name, &value);
+    const bool ok = instance->host->set_instance_field(instance->vm_object, name, value);
+    if (korkscript_debug_properties_enabled()) {
+        UtilityFunctions::print(vformat("[korkscript-prop] instance_set.end owner=%s property=%s ok=%d",
+                instance->owner != nullptr ? String(instance->owner->get_class()) : String("<null>"),
+                String(name),
+                ok ? 1 : 0));
+    }
+    return ok;
 }
 
 GDExtensionBool instance_get(GDExtensionScriptInstanceDataPtr p_instance, GDExtensionConstStringNamePtr p_name, GDExtensionVariantPtr r_ret) {
@@ -145,6 +185,7 @@ GDExtensionBool instance_get(GDExtensionScriptInstanceDataPtr p_instance, GDExte
         return false;
     }
 
+    log_property_debug(instance, "instance_get.hit", name, &value);
     *reinterpret_cast<Variant *>(r_ret) = value;
     return true;
 }
@@ -161,6 +202,11 @@ const GDExtensionPropertyInfo *instance_get_property_list(GDExtensionScriptInsta
     }
 
     const TypedArray<Dictionary> properties = instance->host->get_instance_field_list(instance->vm_object);
+    if (korkscript_debug_properties_enabled()) {
+        UtilityFunctions::print(vformat("[korkscript-prop] instance_get_property_list owner=%s count=%d",
+                instance->owner != nullptr ? String(instance->owner->get_class()) : String("<null>"),
+                static_cast<int64_t>(properties.size())));
+    }
     const uint32_t count = static_cast<uint32_t>(properties.size());
     if (count == 0) {
         return nullptr;
@@ -220,15 +266,6 @@ GDExtensionObjectPtr instance_get_owner(GDExtensionScriptInstanceDataPtr p_insta
     return instance != nullptr && instance->owner != nullptr ? instance->owner->_owner : nullptr;
 }
 
-void instance_get_property_state(GDExtensionScriptInstanceDataPtr p_instance, GDExtensionScriptInstancePropertyStateAdd p_add_func, void *p_userdata) {
-    KorkScriptInstance *instance = static_cast<KorkScriptInstance *>(p_instance);
-    if (!sync_instance_vm_object(instance)) {
-        return;
-    }
-
-    instance->host->add_instance_property_state(instance->vm_object, p_add_func, p_userdata);
-}
-
 const GDExtensionMethodInfo *instance_get_method_list(GDExtensionScriptInstanceDataPtr, uint32_t *r_count) {
     *r_count = 0;
     return nullptr;
@@ -252,6 +289,13 @@ GDExtensionVariantType instance_get_property_type(GDExtensionScriptInstanceDataP
 
     bool exists = false;
     const Variant::Type type = instance->host->get_instance_field_type(instance->vm_object, name, &exists);
+    if (korkscript_debug_properties_enabled()) {
+        UtilityFunctions::print(vformat("[korkscript-prop] instance_get_property_type owner=%s property=%s exists=%d type=%d",
+                instance->owner != nullptr ? String(instance->owner->get_class()) : String("<null>"),
+                String(name),
+                exists ? 1 : 0,
+                static_cast<int64_t>(type)));
+    }
     *r_is_valid = exists;
     return static_cast<GDExtensionVariantType>(type);
 }
@@ -275,7 +319,7 @@ GDExtensionBool instance_has_method(GDExtensionScriptInstanceDataPtr p_instance,
         return true;
     }
 
-    return sync_instance_vm_object(instance) && instance->host->has_signal(instance->vm_object, name);
+    return false;
 }
 
 GDExtensionInt instance_get_method_argument_count(GDExtensionScriptInstanceDataPtr, GDExtensionConstStringNamePtr, GDExtensionBool *r_is_valid) {
@@ -292,17 +336,6 @@ void instance_call(GDExtensionScriptInstanceDataPtr p_self, GDExtensionConstStri
 
     const StringName &method_name = *reinterpret_cast<const StringName *>(p_method);
     if (should_skip_editor_callback(instance, method_name)) {
-        *reinterpret_cast<Variant *>(r_return) = Variant();
-        set_call_error(r_error, GDEXTENSION_CALL_OK);
-        return;
-    }
-
-    if (instance->host->has_signal(instance->vm_object, method_name)) {
-        std::vector<const Variant *> signal_args(static_cast<size_t>(p_argument_count));
-        for (GDExtensionInt i = 0; i < p_argument_count; ++i) {
-            signal_args[static_cast<size_t>(i)] = reinterpret_cast<const Variant *>(p_args[i]);
-        }
-        instance->host->trigger_signal(instance->vm_object, method_name, signal_args.data(), p_argument_count);
         *reinterpret_cast<Variant *>(r_return) = Variant();
         set_call_error(r_error, GDEXTENSION_CALL_OK);
         return;
@@ -413,7 +446,7 @@ const GDExtensionScriptInstanceInfo3 script_instance_info = {
     &instance_property_can_revert,
     &instance_property_get_revert,
     &instance_get_owner,
-    &instance_get_property_state,
+    nullptr,
     &instance_get_method_list,
     &instance_free_method_list,
     &instance_get_property_type,
@@ -427,8 +460,8 @@ const GDExtensionScriptInstanceInfo3 script_instance_info = {
     &instance_refcount_decremented,
     &instance_get_script,
     &instance_is_placeholder,
-    &instance_set,
-    &instance_get,
+    nullptr,
+    nullptr,
     &instance_get_language,
     &instance_free
 };
@@ -697,6 +730,11 @@ Error KorkScript::_reload(bool) {
     return OK;
 }
 
+StringName KorkScript::_get_doc_class_name() const {
+    const String effective_namespace = get_effective_namespace_name();
+    return effective_namespace.is_empty() ? StringName("KorkScript") : StringName(effective_namespace);
+}
+
 TypedArray<Dictionary> KorkScript::_get_documentation() const {
     return TypedArray<Dictionary>();
 }
@@ -860,6 +898,10 @@ int32_t KorkScript::_get_member_line(const StringName &p_member) const {
         return metadata->line;
     }
     return find_method_line_in_code(source_code_, String(p_member));
+}
+
+Dictionary KorkScript::_get_constants() const {
+    return Dictionary();
 }
 
 TypedArray<StringName> KorkScript::_get_members() const {

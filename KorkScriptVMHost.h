@@ -110,6 +110,11 @@ private:
     Variant value_from_console_assignment_args(U32 argc, KorkApi::ConsoleValue *argv) const;
     bool try_get_object_property(Object *owner, const StringName &property, Variant &value) const;
     bool try_set_object_property(Object *owner, const StringName &property, const Variant &value) const;
+    bool get_script_class_field_info(KorkApi::VMObject *vm_object, const StringName &field, KorkApi::ScriptClassFieldInfo *out_info = nullptr) const;
+    bool get_namespace_parent(KorkApi::NamespaceId ns_id, KorkApi::NamespaceId &r_parent, String *r_parent_name = nullptr) const;
+    bool namespace_inherits_from(KorkApi::NamespaceId ns_id, KorkApi::NamespaceId ancestor_id) const;
+    KorkApi::ClassId resolve_vm_object_class(Object *owner, const KorkScript *script, KorkApi::NamespaceId &r_namespace);
+    Variant get_vm_object_field_value(KorkApi::VMObject *vm_object, const StringName &field) const;
     uint64_t get_dynamic_field_owner_key(const KorkApi::VMObject *vm_object) const;
     uint64_t get_dynamic_field_owner_key(const Object *owner) const;
     KorkApi::SimObjectId ensure_sim_object_id(Object *owner) const;
@@ -184,6 +189,7 @@ private:
     mutable KorkApi::SimObjectId next_sim_id_;
     uint64_t generation_;
     bool reload_pending_;
+    int script_instance_field_write_depth_;
     mutable std::vector<uint64_t> execution_target_stack_;
 };
 
