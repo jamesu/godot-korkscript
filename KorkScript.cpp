@@ -2,6 +2,7 @@
 
 #include "KorkScriptLanguage.h"
 #include "KorkScriptVMHost.h"
+#include "ext/korkscript/engine/console/ast.h"
 
 #include <godot_cpp/classes/engine.hpp>
 #include <godot_cpp/classes/class_db_singleton.hpp>
@@ -19,55 +20,6 @@ namespace godot {
 namespace {
 
 std::string string_name_key(const StringName &name);
-
-String strip_script_comments(const String &source) {
-    String out;
-
-    bool in_string = false;
-    bool in_line_comment = false;
-    bool in_block_comment = false;
-
-    for (int i = 0; i < source.length(); ++i) {
-        const char32_t c = source[i];
-        const char32_t next = i + 1 < source.length() ? source[i + 1] : 0;
-
-        if (in_line_comment) {
-            if (c == '\n') {
-                in_line_comment = false;
-                out += String::chr(c);
-            }
-            continue;
-        }
-
-        if (in_block_comment) {
-            if (c == '*' && next == '/') {
-                in_block_comment = false;
-                ++i;
-            }
-            continue;
-        }
-
-        if (!in_string && c == '/' && next == '/') {
-            in_line_comment = true;
-            ++i;
-            continue;
-        }
-
-        if (!in_string && c == '/' && next == '*') {
-            in_block_comment = true;
-            ++i;
-            continue;
-        }
-
-        if (c == '"' && (i == 0 || source[i - 1] != '\\')) {
-            in_string = !in_string;
-        }
-
-        out += String::chr(c);
-    }
-
-    return out;
-}
 
 Variant::Type parse_class_field_variant_type(const String &type_name) {
     const String type = type_name.strip_edges();
@@ -101,106 +53,85 @@ Variant::Type parse_class_field_variant_type(const String &type_name) {
     return Variant::NIL;
 }
 
-Variant parse_class_field_default_value(const String &value_text, Variant::Type type, bool *r_ok = nullptr) {
+Variant parse_class_field_default_expr(const ExprNode *expr, Variant::Type type, bool *r_ok = nullptr) {
     if (r_ok != nullptr) {
         *r_ok = false;
     }
 
-    const String text = value_text.strip_edges();
-    if (text.is_empty()) {
+    if (expr == nullptr) {
         return Variant();
     }
 
-    switch (type) {
-        case Variant::BOOL:
-            if (text == "true" || text == "1") {
+    switch (expr->getASTNodeType()) {
+        case ASTNodeInt: {
+            const IntNode *node = static_cast<const IntNode *>(expr);
+            if (type == Variant::FLOAT) {
                 if (r_ok != nullptr) {
                     *r_ok = true;
                 }
-                return true;
+                return static_cast<double>(node->value);
             }
-            if (text == "false" || text == "0") {
+            if (type == Variant::BOOL) {
                 if (r_ok != nullptr) {
                     *r_ok = true;
                 }
-                return false;
+                return node->value != 0;
+            }
+            if (type == Variant::INT) {
+                if (r_ok != nullptr) {
+                    *r_ok = true;
+                }
+                return static_cast<int64_t>(node->value);
             }
             return Variant();
-        case Variant::FLOAT:
-            if (r_ok != nullptr) {
-                *r_ok = true;
-            }
-            return text.to_float();
-        case Variant::INT:
-            if (r_ok != nullptr) {
-                *r_ok = true;
-            }
-            return static_cast<int64_t>(text.to_int());
-        case Variant::STRING:
-            if (text.length() >= 2 && text.begins_with("\"") && text.ends_with("\"")) {
+        }
+        case ASTNodeFloat: {
+            const FloatNode *node = static_cast<const FloatNode *>(expr);
+            if (type == Variant::FLOAT) {
                 if (r_ok != nullptr) {
                     *r_ok = true;
                 }
-                return text.substr(1, text.length() - 2);
+                return node->value;
             }
             return Variant();
+        }
+        case ASTNodeStrConst: {
+            const StrConstNode *node = static_cast<const StrConstNode *>(expr);
+            if (type == Variant::STRING && node->str != nullptr) {
+                if (r_ok != nullptr) {
+                    *r_ok = true;
+                }
+                return String(node->str);
+            }
+            return Variant();
+        }
+        case ASTNodeConstant: {
+            const ConstantNode *node = static_cast<const ConstantNode *>(expr);
+            const String value = String(node->value);
+            if (type == Variant::BOOL) {
+                if (value == "true" || value == "1") {
+                    if (r_ok != nullptr) {
+                        *r_ok = true;
+                    }
+                    return true;
+                }
+                if (value == "false" || value == "0") {
+                    if (r_ok != nullptr) {
+                        *r_ok = true;
+                    }
+                    return false;
+                }
+            }
+            if (type == Variant::STRING) {
+                if (r_ok != nullptr) {
+                    *r_ok = true;
+                }
+                return value;
+            }
+            return Variant();
+        }
         default:
             return Variant();
-    }
-}
-
-void parse_script_class_fields(const String &source_code,
-        std::unordered_map<std::string, KorkScript::ClassFieldMetadata> &out_metadata,
-        std::vector<std::string> &out_order) {
-    out_metadata.clear();
-    out_order.clear();
-
-    const String sanitized_source = strip_script_comments(source_code);
-    const int class_pos = sanitized_source.find("class ");
-    if (class_pos < 0) {
-        return;
-    }
-
-    const int open_brace = sanitized_source.find("{", class_pos);
-    const int close_brace = open_brace >= 0 ? sanitized_source.find("};", open_brace) : -1;
-    if (open_brace < 0 || close_brace < 0 || close_brace <= open_brace) {
-        return;
-    }
-
-    const String body = sanitized_source.substr(open_brace + 1, close_brace - (open_brace + 1));
-    PackedStringArray declarations = body.split(";", false);
-    for (int i = 0; i < declarations.size(); ++i) {
-        const String declaration = declarations[i].strip_edges();
-        if (declaration.is_empty()) {
-            continue;
-        }
-
-        const int colon_pos = declaration.find(":");
-        if (colon_pos <= 0) {
-            continue;
-        }
-
-        const String field_name = declaration.substr(0, colon_pos).strip_edges();
-        const String remainder = declaration.substr(colon_pos + 1).strip_edges();
-        const int equals_pos = remainder.find("=");
-        const String type_name = (equals_pos >= 0 ? remainder.substr(0, equals_pos) : remainder).strip_edges();
-        const String default_text = equals_pos >= 0 ? remainder.substr(equals_pos + 1).strip_edges() : String();
-        if (field_name.is_empty() || type_name.is_empty()) {
-            continue;
-        }
-
-        KorkScript::ClassFieldMetadata metadata;
-        metadata.name = StringName(field_name);
-        metadata.type = parse_class_field_variant_type(type_name);
-        bool has_default = false;
-        metadata.default_value = parse_class_field_default_value(default_text, metadata.type, &has_default);
-        metadata.has_default = has_default;
-
-        const std::string key = string_name_key(StringName(field_name));
-        if (out_metadata.find(key) == out_metadata.end()) {
-            out_order.push_back(key);
-        }
-        out_metadata[key] = metadata;
     }
 }
 
@@ -657,117 +588,20 @@ Variant::Type variant_type_from_name(const String &type_name) {
     return Variant::NIL;
 }
 
-int32_t find_method_line_in_code(const String &code, const String &method_name) {
-    String normalized_name = method_name.strip_edges();
-    if (normalized_name.is_empty()) {
-        return -1;
-    }
-
-    const int brace_pos = normalized_name.find("{");
-    if (brace_pos >= 0) {
-        normalized_name = normalized_name.substr(0, brace_pos).strip_edges();
-    }
-    const int paren_pos = normalized_name.find("(");
-    if (paren_pos >= 0) {
-        normalized_name = normalized_name.substr(0, paren_pos).strip_edges();
-    }
-    const int ns_lookup_pos = normalized_name.rfind("::");
-    if (ns_lookup_pos >= 0) {
-        normalized_name = normalized_name.substr(ns_lookup_pos + 2).strip_edges();
-    }
-
-    int from = 0;
-    while (true) {
-        const int function_pos = code.find("function ", from);
-        if (function_pos < 0) {
-            break;
-        }
-
-        const int ns_pos = code.find("::", function_pos);
-        const int open_paren = code.find("(", function_pos);
-        if (ns_pos > function_pos && open_paren > ns_pos) {
-            const String candidate_name = code.substr(ns_pos + 2, open_paren - (ns_pos + 2)).strip_edges();
-            if (candidate_name == normalized_name) {
-                return 1 + code.count("\n", 0, function_pos);
-            }
-        }
-
-        from = function_pos + 8;
-    }
-
-    return -1;
-}
-
-String infer_class_name_from_code(const String &code) {
-    int from = 0;
-    while (true) {
-        const int class_pos = code.find("class ", from);
-        if (class_pos < 0) {
-            return String();
-        }
-
-        int name_start = class_pos + 6;
-        while (name_start < code.length() && String::chr(code[name_start]).strip_edges().is_empty()) {
-            ++name_start;
-        }
-
-        int name_end = name_start;
-        while (name_end < code.length()) {
-            const char32_t c = code[name_end];
-            const bool valid_ident = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_';
-            if (!valid_ident) {
-                break;
-            }
-            ++name_end;
-        }
-
-        const String class_name = code.substr(name_start, name_end - name_start).strip_edges();
-        if (!class_name.is_empty()) {
-            return class_name;
-        }
-
-        from = class_pos + 6;
-    }
-}
-
-String infer_namespace_from_signal_decls(const String &code) {
-    int from = 0;
-    while (true) {
-        const int signal_pos = code.find("signal ", from);
-        if (signal_pos < 0) {
-            return String();
-        }
-
-        const int ns_pos = code.find("::", signal_pos);
-        const int open_paren = code.find("(", signal_pos);
-        if (ns_pos > signal_pos && open_paren > ns_pos) {
-            const String namespace_name = code.substr(signal_pos + 7, ns_pos - (signal_pos + 7)).strip_edges();
-            if (!namespace_name.is_empty()) {
-                return namespace_name;
-            }
-        }
-
-        from = signal_pos + 7;
-    }
-}
-
-KorkScript::MethodArgumentMetadata parse_method_argument(const String &argument_text) {
+KorkScript::MethodArgumentMetadata parse_method_argument(const VarNode *argument_node) {
     KorkScript::MethodArgumentMetadata metadata;
-    String token = argument_text.strip_edges();
-    if (token.is_empty()) {
+    if (argument_node == nullptr || argument_node->varName == nullptr) {
         return metadata;
     }
 
-    const int colon_pos = token.find(":");
-    String name_part = colon_pos >= 0 ? token.substr(0, colon_pos) : token;
-    String type_part = colon_pos >= 0 ? token.substr(colon_pos + 1) : String();
-
+    String name_part = String(argument_node->varName).strip_edges();
     name_part = name_part.strip_edges();
     if (name_part.begins_with("%")) {
         name_part = name_part.substr(1);
     }
     metadata.name = StringName(name_part);
 
+    String type_part = String(argument_node->varType).strip_edges();
     type_part = type_part.strip_edges();
     metadata.type = variant_type_from_name(type_part);
     if (metadata.type == Variant::NIL && !type_part.is_empty()) {
@@ -775,6 +609,93 @@ KorkScript::MethodArgumentMetadata parse_method_argument(const String &argument_
     }
 
     return metadata;
+}
+
+struct AstScriptMetadata {
+    String inferred_namespace_name;
+    std::unordered_set<std::string> method_names;
+    std::unordered_map<std::string, KorkScript::MethodMetadata> method_metadata;
+    std::vector<std::string> method_order;
+    std::unordered_map<std::string, KorkScript::ClassFieldMetadata> class_field_metadata;
+    std::vector<std::string> class_field_order;
+};
+
+KorkApi::AstEnumerationControl collect_script_metadata_from_ast(void *user_ptr, const KorkApi::AstEnumerationInfo *info) {
+    if (user_ptr == nullptr || info == nullptr) {
+        return KorkApi::AstEnumerationContinue;
+    }
+
+    AstScriptMetadata *out = static_cast<AstScriptMetadata *>(user_ptr);
+    if (info->kind == KorkApi::AstEnumerationNodeStmt) {
+        switch (info->nodeType) {
+            case ASTNodeClassDeclStmt: {
+                const ClassDeclStmtNode *class_node = static_cast<const ClassDeclStmtNode *>(info->stmtNode);
+                if (class_node != nullptr && out->inferred_namespace_name.is_empty() && class_node->className != nullptr) {
+                    out->inferred_namespace_name = String(class_node->className);
+                }
+                break;
+            }
+            case ASTNodeFunctionDeclStmt: {
+                const FunctionDeclStmtNode *function_node = static_cast<const FunctionDeclStmtNode *>(info->stmtNode);
+                if (function_node == nullptr || function_node->fnName == nullptr) {
+                    break;
+                }
+
+                const String namespace_name = String(function_node->nameSpace).strip_edges();
+                if (out->inferred_namespace_name.is_empty() && !namespace_name.is_empty()) {
+                    out->inferred_namespace_name = namespace_name;
+                }
+
+                if (function_node->isSignal) {
+                    break;
+                }
+
+                const String method_name = String(function_node->fnName).strip_edges();
+                if (method_name.is_empty()) {
+                    break;
+                }
+
+                const std::string method_key = string_name_key(StringName(method_name));
+                out->method_names.insert(method_key);
+                if (out->method_metadata.find(method_key) == out->method_metadata.end()) {
+                    out->method_order.push_back(method_key);
+                }
+
+                KorkScript::MethodMetadata metadata;
+                for (const VarNode *arg = function_node->args; arg != nullptr; arg = static_cast<const VarNode *>(arg->getNext())) {
+                    KorkScript::MethodArgumentMetadata argument_metadata = parse_method_argument(arg);
+                    if (argument_metadata.name.is_empty()) {
+                        continue;
+                    }
+                    if (metadata.arguments.empty() && argument_metadata.name == StringName("this")) {
+                        continue;
+                    }
+                    metadata.arguments.push_back(argument_metadata);
+                }
+                metadata.line = function_node->dbgLineNumber > 0 ? function_node->dbgLineNumber : -1;
+                out->method_metadata[method_key] = metadata;
+                break;
+            }
+            default:
+                break;
+        }
+    } else if (info->kind == KorkApi::AstEnumerationNodeScriptClassField) {
+        const ScriptClassFieldDecl *field_node = info->scriptClassFieldNode;
+        if (field_node != nullptr && field_node->fieldName != nullptr) {
+            KorkScript::ClassFieldMetadata metadata;
+            metadata.name = StringName(String(field_node->fieldName).strip_edges());
+            metadata.type = parse_class_field_variant_type(String(field_node->typeName).strip_edges());
+            metadata.default_value = parse_class_field_default_expr(field_node->defaultExpr, metadata.type, &metadata.has_default);
+
+            const std::string key = string_name_key(metadata.name);
+            if (out->class_field_metadata.find(key) == out->class_field_metadata.end()) {
+                out->class_field_order.push_back(key);
+            }
+            out->class_field_metadata[key] = metadata;
+        }
+    }
+
+    return KorkApi::AstEnumerationContinue;
 }
 
 } // namespace
@@ -1173,7 +1094,7 @@ int32_t KorkScript::_get_member_line(const StringName &p_member) const {
     if (metadata != nullptr && metadata->line > 0) {
         return metadata->line;
     }
-    return find_method_line_in_code(source_code_, String(p_member));
+    return -1;
 }
 
 Dictionary KorkScript::_get_constants() const {
@@ -1243,61 +1164,20 @@ void KorkScript::refresh_method_cache() {
     class_field_metadata_.clear();
     class_field_order_.clear();
     inferred_namespace_name_ = String();
-
-    const String inferred_class_name = infer_class_name_from_code(source_code_);
-    if (!inferred_class_name.is_empty()) {
-        inferred_namespace_name_ = inferred_class_name;
+    KorkScriptLanguage *language = KorkScriptLanguage::get_singleton();
+    KorkScriptVMHost *host = language != nullptr ? language->get_vm_host(vm_name_) : nullptr;
+    if (host == nullptr) {
+        return;
     }
 
-    int from = 0;
-    while (true) {
-        const int function_pos = source_code_.find("function ", from);
-        if (function_pos < 0) {
-            break;
-        }
-
-        const int ns_pos = source_code_.find("::", function_pos);
-        const int open_paren = source_code_.find("(", function_pos);
-        const int close_paren = open_paren >= 0 ? source_code_.find(")", open_paren) : -1;
-        if (ns_pos > function_pos && open_paren > ns_pos && close_paren > open_paren) {
-            const String namespace_name = source_code_.substr(function_pos + 9, ns_pos - (function_pos + 9)).strip_edges();
-            const String method_name = source_code_.substr(ns_pos + 2, open_paren - (ns_pos + 2)).strip_edges();
-            if (!method_name.is_empty()) {
-                const std::string method_key = string_name_key(StringName(method_name));
-                method_names_.insert(method_key);
-                if (method_metadata_.find(method_key) == method_metadata_.end()) {
-                    method_order_.push_back(method_key);
-                }
-                if (inferred_namespace_name_.is_empty() && !namespace_name.is_empty()) {
-                    inferred_namespace_name_ = namespace_name;
-                }
-
-                MethodMetadata metadata;
-                const String arguments_text = source_code_.substr(open_paren + 1, close_paren - (open_paren + 1));
-                PackedStringArray arguments = arguments_text.split(",");
-                for (int i = 0; i < arguments.size(); ++i) {
-                    MethodArgumentMetadata argument_metadata = parse_method_argument(arguments[i]);
-                    if (argument_metadata.name.is_empty()) {
-                        continue;
-                    }
-                    if (metadata.arguments.empty() && argument_metadata.name == StringName("this")) {
-                        continue;
-                    }
-                    metadata.arguments.push_back(argument_metadata);
-                }
-                metadata.line = 1 + source_code_.count("\n", 0, function_pos);
-                method_metadata_[method_key] = metadata;
-            }
-        }
-
-        from = function_pos + 8;
-    }
-
-    if (inferred_namespace_name_.is_empty()) {
-        inferred_namespace_name_ = infer_namespace_from_signal_decls(source_code_);
-    }
-
-    parse_script_class_fields(source_code_, class_field_metadata_, class_field_order_);
+    AstScriptMetadata metadata;
+    host->enumerate_ast(source_code_, String("[KorkScriptMetadata]"), &metadata, &collect_script_metadata_from_ast);
+    inferred_namespace_name_ = std::move(metadata.inferred_namespace_name);
+    method_names_ = std::move(metadata.method_names);
+    method_metadata_ = std::move(metadata.method_metadata);
+    method_order_ = std::move(metadata.method_order);
+    class_field_metadata_ = std::move(metadata.class_field_metadata);
+    class_field_order_ = std::move(metadata.class_field_order);
 }
 
 const KorkScript::MethodMetadata *KorkScript::get_method_metadata(const StringName &method) const {

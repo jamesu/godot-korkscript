@@ -673,6 +673,16 @@ uint64_t KorkScriptVMHost::get_generation() const {
     return generation_;
 }
 
+KorkApi::AstEnumerationResult KorkScriptVMHost::enumerate_ast(const String &code, const String &filename, void *user_ptr, KorkApi::AstEnumerationCallback callback, KorkApi::AstParseErrorInfo *out_error) const {
+    if (vm_ == nullptr || callback == nullptr) {
+        return KorkApi::AstEnumerationParseFailed;
+    }
+
+    const CharString code_utf8 = code.utf8();
+    const CharString filename_utf8 = filename.utf8();
+    return vm_->enumerateAst(code_utf8.get_data(), filename_utf8.get_data(), user_ptr, callback, out_error);
+}
+
 KorkApi::Vm *KorkScriptVMHost::get_vm_for_generation(uint64_t generation) const {
     if (generation == generation_) {
         return vm_;

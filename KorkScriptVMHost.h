@@ -28,6 +28,7 @@ public:
     KorkApi::Vm *get_vm() const;
     const String &get_vm_name() const;
     uint64_t get_generation() const;
+    KorkApi::AstEnumerationResult enumerate_ast(const String &code, const String &filename, void *user_ptr, KorkApi::AstEnumerationCallback callback, KorkApi::AstParseErrorInfo *out_error = nullptr) const;
 
     bool ensure_script_loaded(const KorkScript *script);
     void notify_script_changed(const KorkScript *script);

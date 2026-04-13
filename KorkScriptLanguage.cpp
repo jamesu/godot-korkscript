@@ -2,6 +2,7 @@
 
 #include "KorkScript.h"
 #include "KorkScriptVMHost.h"
+#include "ext/korkscript/engine/console/ast.h"
 
 #include <godot_cpp/core/class_db.hpp>
 #include <godot_cpp/core/memory.hpp>
@@ -17,13 +18,16 @@ namespace godot {
 KorkScriptLanguage *KorkScriptLanguage::singleton_ = nullptr;
 
 namespace {
+struct FunctionEntry {
+    String name;
+    int32_t line = -1;
+};
 
 String normalize_function_name(const String &p_function) {
     String normalized_name = p_function.strip_edges();
     if (normalized_name.is_empty()) {
         return String();
     }
-
     const int brace_pos = normalized_name.find("{");
     if (brace_pos >= 0) {
         normalized_name = normalized_name.substr(0, brace_pos).strip_edges();
@@ -36,50 +40,47 @@ String normalize_function_name(const String &p_function) {
     if (ns_lookup_pos >= 0) {
         normalized_name = normalized_name.substr(ns_lookup_pos + 2).strip_edges();
     }
-
     return normalized_name;
 }
 
-struct FunctionEntry {
-    String name;
-    int32_t line = -1;
-};
-
-std::vector<FunctionEntry> scan_function_entries(const String &code) {
-    std::vector<FunctionEntry> out;
-
-    int from = 0;
-    while (true) {
-        const int function_pos = code.find("function ", from);
-        if (function_pos < 0) {
-            break;
-        }
-
-        const int ns_pos = code.find("::", function_pos);
-        const int open_paren = code.find("(", function_pos);
-        if (ns_pos > function_pos && open_paren > ns_pos) {
-            const String method_name = code.substr(ns_pos + 2, open_paren - (ns_pos + 2)).strip_edges();
-            if (!method_name.is_empty()) {
-                FunctionEntry entry;
-                entry.name = method_name;
-                entry.line = 1 + code.count("\n", 0, function_pos);
-                out.push_back(entry);
-            }
-        }
-
-        from = function_pos + 8;
+KorkApi::AstEnumerationControl collect_function_entries(void *user_ptr, const KorkApi::AstEnumerationInfo *info) {
+    if (user_ptr == nullptr || info == nullptr || info->kind != KorkApi::AstEnumerationNodeStmt || info->nodeType != ASTNodeFunctionDeclStmt) {
+        return KorkApi::AstEnumerationContinue;
     }
 
+    std::vector<FunctionEntry> *out = static_cast<std::vector<FunctionEntry> *>(user_ptr);
+    const FunctionDeclStmtNode *function_node = static_cast<const FunctionDeclStmtNode *>(info->stmtNode);
+    if (function_node == nullptr || function_node->fnName == nullptr || function_node->isSignal) {
+        return KorkApi::AstEnumerationContinue;
+    }
+
+    const String method_name = String(function_node->fnName).strip_edges();
+    if (!method_name.is_empty()) {
+        FunctionEntry entry;
+        entry.name = method_name;
+        entry.line = function_node->dbgLineNumber > 0 ? function_node->dbgLineNumber : -1;
+        out->push_back(entry);
+    }
+    return KorkApi::AstEnumerationContinue;
+}
+
+std::vector<FunctionEntry> scan_function_entries(KorkScriptVMHost *host, const String &code) {
+    std::vector<FunctionEntry> out;
+    if (host == nullptr) {
+        return out;
+    }
+
+    host->enumerate_ast(code, String("[KorkScriptLanguageValidate]"), &out, &collect_function_entries);
     return out;
 }
 
-int32_t find_function_line(const String &p_function, const String &p_code) {
+int32_t find_function_line(KorkScriptVMHost *host, const String &p_function, const String &p_code) {
     const String normalized_name = normalize_function_name(p_function);
     if (normalized_name.is_empty()) {
         return -1;
     }
 
-    const std::vector<FunctionEntry> functions = scan_function_entries(p_code);
+    const std::vector<FunctionEntry> functions = scan_function_entries(host, p_code);
     for (const FunctionEntry &entry : functions) {
         if (entry.name == normalized_name) {
             return entry.line;
@@ -89,9 +90,9 @@ int32_t find_function_line(const String &p_function, const String &p_code) {
     return -1;
 }
 
-PackedStringArray scan_functions(const String &code) {
+PackedStringArray scan_functions(KorkScriptVMHost *host, const String &code) {
     PackedStringArray out;
-    const std::vector<FunctionEntry> functions = scan_function_entries(code);
+    const std::vector<FunctionEntry> functions = scan_function_entries(host, code);
     for (const FunctionEntry &entry : functions) {
         out.push_back(vformat("%s:%d", entry.name, entry.line));
     }
@@ -204,7 +205,8 @@ Dictionary KorkScriptLanguage::_validate(const String &p_script, const String &,
     result["errors"] = TypedArray<Dictionary>();
     result["warnings"] = TypedArray<Dictionary>();
     result["safe_lines"] = PackedInt32Array();
-    result["functions"] = p_validate_functions ? Variant(scan_functions(p_script)) : Variant(PackedStringArray());
+    KorkScriptVMHost *host = const_cast<KorkScriptLanguage *>(this)->get_vm_host(String("default"));
+    result["functions"] = p_validate_functions ? Variant(scan_functions(host, p_script)) : Variant(PackedStringArray());
     return result;
 }
 
@@ -244,7 +246,8 @@ bool KorkScriptLanguage::_can_inherit_from_file() const {
 }
 
 int32_t KorkScriptLanguage::_find_function(const String &p_function, const String &p_code) const {
-    return find_function_line(p_function, p_code);
+    KorkScriptVMHost *host = const_cast<KorkScriptLanguage *>(this)->get_vm_host(String("default"));
+    return find_function_line(host, p_function, p_code);
 }
 
 bool KorkScriptLanguage::_can_make_function() const {
