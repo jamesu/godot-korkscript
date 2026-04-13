@@ -5,9 +5,6 @@
 #include <godot_cpp/classes/file_access.hpp>
 #include <godot_cpp/classes/resource.hpp>
 #include <godot_cpp/core/class_db.hpp>
-#include <godot_cpp/variant/utility_functions.hpp>
-
-#include <cstdlib>
 
 namespace godot {
 
@@ -16,20 +13,6 @@ namespace {
 bool is_ks_path(const String &path) {
     const String lower_path = path.to_lower();
     return lower_path.ends_with(".ks") || lower_path.ends_with(".tscript");
-}
-
-bool debug_global_classes_enabled() {
-    static const bool enabled = []() {
-        const char *value = std::getenv("KORKSCRIPT_DEBUG_GLOBAL_CLASSES");
-        return value != nullptr && *value != '\0' && String(value) != "0";
-    }();
-    return enabled;
-}
-
-void debug_global_classes_log(const String &message) {
-    if (debug_global_classes_enabled()) {
-        UtilityFunctions::print(vformat("[korkscript-global] %s", message));
-    }
 }
 
 } // namespace
@@ -67,9 +50,7 @@ String KorkScriptResourceFormatLoader::_get_resource_script_class(const String &
     script.instantiate();
     script->set_path(p_path);
     script->set_source_code(file->get_as_text());
-    const String class_name = script->get_effective_namespace_name();
-    debug_global_classes_log(vformat("loader.get_resource_script_class path=%s class=%s", p_path, class_name));
-    return class_name;
+    return script->get_effective_namespace_name();
 }
 
 bool KorkScriptResourceFormatLoader::_exists(const String &p_path) const {

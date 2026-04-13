@@ -4,15 +4,11 @@
 #include "KorkScriptVMHost.h"
 #include "ext/korkscript/engine/console/ast.h"
 
-#include <godot_cpp/classes/dir_access.hpp>
-#include <godot_cpp/classes/project_settings.hpp>
-#include <godot_cpp/variant/utility_functions.hpp>
 #include <godot_cpp/core/class_db.hpp>
 #include <godot_cpp/core/memory.hpp>
 #include <godot_cpp/classes/resource_loader.hpp>
 #include <godot_cpp/classes/resource.hpp>
 
-#include <cstdlib>
 #include <vector>
 
 namespace godot {
@@ -24,20 +20,6 @@ namespace godot {
 KorkScriptLanguage *KorkScriptLanguage::singleton_ = nullptr;
 
 namespace {
-bool debug_global_classes_enabled() {
-    static const bool enabled = []() {
-        const char *value = std::getenv("KORKSCRIPT_DEBUG_GLOBAL_CLASSES");
-        return value != nullptr && *value != '\0' && String(value) != "0";
-    }();
-    return enabled;
-}
-
-void debug_global_classes_log(const String &message) {
-    if (debug_global_classes_enabled()) {
-        UtilityFunctions::print(vformat("[korkscript-global] %s", message));
-    }
-}
-
 struct FunctionEntry {
     String name;
     int32_t line = -1;
@@ -119,93 +101,6 @@ PackedStringArray scan_functions(KorkScriptVMHost *host, const String &code) {
     return out;
 }
 
-void collect_kork_script_paths(const String &path, PackedStringArray &out_paths) {
-    Ref<DirAccess> dir = DirAccess::open(path);
-    if (dir.is_null()) {
-        return;
-    }
-
-    if (dir->list_dir_begin() != OK) {
-        return;
-    }
-
-    for (String entry = dir->get_next(); !entry.is_empty(); entry = dir->get_next()) {
-        if (entry == "." || entry == "..") {
-            continue;
-        }
-
-        const String child_path = path.path_join(entry);
-        if (dir->current_is_dir()) {
-            collect_kork_script_paths(child_path, out_paths);
-            continue;
-        }
-
-        const String ext = entry.get_extension().to_lower();
-        if (ext == "ks" || ext == "tscript") {
-            out_paths.push_back(child_path);
-        }
-    }
-
-    dir->list_dir_end();
-}
-
-void refresh_kork_global_class_cache() {
-    ProjectSettings *project_settings = ProjectSettings::get_singleton();
-    ResourceLoader *loader = ResourceLoader::get_singleton();
-    if (project_settings == nullptr || loader == nullptr) {
-        debug_global_classes_log("cache refresh skipped: missing ProjectSettings or ResourceLoader");
-        return;
-    }
-
-    Array merged = project_settings->get_global_class_list();
-    Array kept;
-    kept.resize(0);
-    for (int i = 0; i < merged.size(); ++i) {
-        Dictionary entry = merged[i];
-        const String language = String(entry.get("language", ""));
-        const String path = String(entry.get("path", ""));
-        const String ext = path.get_extension().to_lower();
-        if (language == String(KORKSCRIPT_LANGUAGE_NAME) || ext == "ks" || ext == "tscript") {
-            continue;
-        }
-        kept.push_back(entry);
-    }
-
-    PackedStringArray paths;
-    collect_kork_script_paths(String("res://"), paths);
-    debug_global_classes_log(vformat("cache refresh scanning %d kork scripts", paths.size()));
-    for (int i = 0; i < paths.size(); ++i) {
-        const String &path = paths[i];
-        Ref<Resource> resource = loader->load(path, String(), ResourceLoader::CACHE_MODE_REUSE);
-        Ref<KorkScript> script = resource;
-        if (!script.is_valid()) {
-            debug_global_classes_log(vformat("cache refresh load failed for %s", path));
-            continue;
-        }
-
-        const String class_name = script->get_effective_namespace_name();
-        if (class_name.is_empty()) {
-            debug_global_classes_log(vformat("cache refresh no class name for %s", path));
-            continue;
-        }
-
-        Dictionary entry;
-        entry["class"] = class_name;
-        entry["language"] = String(KORKSCRIPT_LANGUAGE_NAME);
-        entry["path"] = path;
-        entry["base"] = script->get_base_type();
-        entry["icon"] = String();
-        entry["is_abstract"] = false;
-        entry["is_tool"] = script->is_tool_enabled();
-        kept.push_back(entry);
-        debug_global_classes_log(vformat("cache refresh registered %s from %s base=%s", class_name, path, script->get_base_type()));
-    }
-
-    project_settings->call(StringName("store_global_class_list"), kept);
-    project_settings->call(StringName("refresh_global_class_list"));
-    debug_global_classes_log(vformat("cache refresh stored %d total global classes", kept.size()));
-}
-
 } // namespace
 
 KorkScriptLanguage::KorkScriptLanguage() {
@@ -246,7 +141,6 @@ void KorkScriptLanguage::notify_script_changed(const KorkScript *script) {
     if (host != nullptr) {
         host->notify_script_changed(script);
     }
-    refresh_kork_global_class_cache();
 }
 
 String KorkScriptLanguage::_get_name() const {
@@ -254,7 +148,6 @@ String KorkScriptLanguage::_get_name() const {
 }
 
 void KorkScriptLanguage::_init() {
-    refresh_kork_global_class_cache();
 }
 
 String KorkScriptLanguage::_get_type() const {
@@ -428,11 +321,7 @@ void KorkScriptLanguage::_frame() {
 }
 
 bool KorkScriptLanguage::_handles_global_class_type(const String &p_type) const {
-    const bool handled = p_type == _get_type() || p_type == String("Script") || p_type == String("Resource");
-    if (debug_global_classes_enabled()) {
-        debug_global_classes_log(vformat("handles_global_class_type type=%s handled=%s", p_type, handled ? "true" : "false"));
-    }
-    return handled;
+    return p_type == _get_type();
 }
 
 Dictionary KorkScriptLanguage::_get_global_class_name(const String &p_path) const {
@@ -443,21 +332,18 @@ Dictionary KorkScriptLanguage::_get_global_class_name(const String &p_path) cons
 
     ResourceLoader *loader = ResourceLoader::get_singleton();
     if (loader == nullptr || !loader->exists(p_path)) {
-        debug_global_classes_log(vformat("get_global_class_name no loader/exists for %s", p_path));
         return out;
     }
 
     Ref<Resource> resource = loader->load(p_path, String(), ResourceLoader::CACHE_MODE_REUSE);
     Ref<KorkScript> script = resource;
     if (!script.is_valid()) {
-        debug_global_classes_log(vformat("get_global_class_name load failed for %s", p_path));
         return out;
     }
 
     const String effective_name = script->get_effective_namespace_name();
     const StringName global_name = effective_name.is_empty() ? StringName() : StringName(effective_name);
     if (global_name.is_empty()) {
-        debug_global_classes_log(vformat("get_global_class_name empty class for %s", p_path));
         return out;
     }
 
@@ -466,7 +352,6 @@ Dictionary KorkScriptLanguage::_get_global_class_name(const String &p_path) cons
     out["icon_path"] = String();
     out["is_abstract"] = false;
     out["is_tool"] = script->is_tool_enabled();
-    debug_global_classes_log(vformat("get_global_class_name path=%s class=%s base=%s", p_path, String(global_name), script->get_base_type()));
     return out;
 }
 
