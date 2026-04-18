@@ -790,10 +790,167 @@ KorkScript::MethodArgumentMetadata parse_method_argument(const VarNode *argument
     return metadata;
 }
 
+String normalize_docblock_text(const char *raw_doc) {
+    if (raw_doc == nullptr || raw_doc[0] == '\0') {
+        return String();
+    }
+
+    const PackedStringArray lines = String(raw_doc).split("\n", false);
+    PackedStringArray normalized_lines;
+    for (int i = 0; i < lines.size(); ++i) {
+        String line = lines[i].strip_edges();
+        if (line.begins_with("///")) {
+            line = line.substr(3).strip_edges();
+        } else if (line.begins_with("//!")) {
+            line = line.substr(3).strip_edges();
+        } else if (line.begins_with("*")) {
+            line = line.substr(1).strip_edges();
+        }
+        normalized_lines.push_back(line);
+    }
+    return String("\n").join(normalized_lines).strip_edges();
+}
+
+bool is_identifier_like_token(String token) {
+    token = token.strip_edges();
+    if (token.begins_with("%")) {
+        token = token.substr(1);
+    }
+    if (token.is_empty()) {
+        return false;
+    }
+
+    const char32_t first = token[0];
+    const bool first_ok = (first >= 'A' && first <= 'Z') || (first >= 'a' && first <= 'z') || first == '_';
+    if (!first_ok) {
+        return false;
+    }
+
+    for (int i = 1; i < token.length(); ++i) {
+        const char32_t ch = token[i];
+        const bool ok = (ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9') || ch == '_';
+        if (!ok) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool looks_like_signature_line(const String &line) {
+    String text = line.strip_edges();
+    if (text.is_empty()) {
+        return false;
+    }
+
+    if (text.begins_with("(") && text.find(")") >= 0) {
+        return true;
+    }
+
+    const bool has_comma = text.find(",") >= 0;
+    if (!has_comma) {
+        return false;
+    }
+
+    if (text.ends_with(";")) {
+        text = text.left(text.length() - 1).strip_edges();
+    }
+
+    const PackedStringArray parts = text.split(",", false);
+    if (parts.size() <= 0) {
+        return false;
+    }
+
+    for (int i = 0; i < parts.size(); ++i) {
+        String part = parts[i].strip_edges();
+        if (part.is_empty()) {
+            return false;
+        }
+
+        const int default_pos = part.find("=");
+        if (default_pos >= 0) {
+            part = part.left(default_pos).strip_edges();
+        }
+
+        const int type_pos = part.find(":");
+        if (type_pos >= 0) {
+            part = part.left(type_pos).strip_edges();
+        }
+
+        if (!is_identifier_like_token(part)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+String format_docblock_text_for_script(const String &normalized_doc, bool preserve_first_signature_line) {
+    if (normalized_doc.is_empty()) {
+        return String();
+    }
+
+    PackedStringArray lines = normalized_doc.split("\n", false);
+    int begin = 0;
+    int end = lines.size();
+    while (begin < end && lines[begin].strip_edges().is_empty()) {
+        ++begin;
+    }
+    while (end > begin && lines[end - 1].strip_edges().is_empty()) {
+        --end;
+    }
+    if (begin >= end) {
+        return String();
+    }
+
+    PackedStringArray trimmed;
+    for (int i = begin; i < end; ++i) {
+        trimmed.push_back(lines[i]);
+    }
+    if (trimmed.is_empty()) {
+        return String();
+    }
+
+    if (!preserve_first_signature_line && looks_like_signature_line(trimmed[0])) {
+        trimmed.remove_at(0);
+        if (!trimmed.is_empty() && trimmed[0].strip_edges().is_empty()) {
+            trimmed.remove_at(0);
+        }
+    }
+
+    begin = 0;
+    end = trimmed.size();
+    while (begin < end && trimmed[begin].strip_edges().is_empty()) {
+        ++begin;
+    }
+    while (end > begin && trimmed[end - 1].strip_edges().is_empty()) {
+        --end;
+    }
+
+    PackedStringArray final_lines;
+    for (int i = begin; i < end; ++i) {
+        final_lines.push_back(trimmed[i]);
+    }
+    return String("\n").join(final_lines).strip_edges();
+}
+
+String parse_docblock_text(const char *raw_doc, bool preserve_first_signature_line = false) {
+    return format_docblock_text_for_script(normalize_docblock_text(raw_doc), preserve_first_signature_line);
+}
+
+String metadata_type_name(Variant::Type type, const StringName &class_name = StringName()) {
+    if (!class_name.is_empty()) {
+        return String(class_name);
+    }
+    if (type == Variant::NIL) {
+        return String("Variant");
+    }
+    return Variant::get_type_name(type);
+}
+
 struct AstScriptMetadata {
     String inferred_namespace_name;
     String declared_script_class_name;
     String declared_script_class_parent_name;
+    String script_class_documentation;
     std::unordered_set<std::string> method_names;
     std::unordered_map<std::string, KorkScript::MethodMetadata> method_metadata;
     std::vector<std::string> method_order;
@@ -802,6 +959,7 @@ struct AstScriptMetadata {
     std::vector<std::string> signal_order;
     std::unordered_map<std::string, KorkScript::ClassFieldMetadata> class_field_metadata;
     std::vector<std::string> class_field_order;
+    std::unordered_map<uint32_t, String> pending_docblocks_by_depth;
 };
 
 bool stmt_list_contains_return(const StmtNode *node) {
@@ -860,6 +1018,27 @@ KorkApi::AstEnumerationControl collect_script_metadata_from_ast(void *user_ptr, 
 
     AstScriptMetadata *out = static_cast<AstScriptMetadata *>(user_ptr);
     if (info->kind == KorkApi::AstEnumerationNodeStmt) {
+        auto consume_pending_doc = [&](uint32_t depth) -> String {
+            const auto found = out->pending_docblocks_by_depth.find(depth);
+            if (found == out->pending_docblocks_by_depth.end()) {
+                return String();
+            }
+            const String value = found->second;
+            out->pending_docblocks_by_depth.erase(found);
+            return value;
+        };
+
+        if (info->nodeType == ASTNodeStrConst) {
+            const StrConstNode *doc_node = static_cast<const StrConstNode *>(info->stmtNode);
+            if (doc_node != nullptr && doc_node->doc) {
+                const String parsed = parse_docblock_text(doc_node->str, false);
+                if (!parsed.is_empty()) {
+                    out->pending_docblocks_by_depth[info->depth] = parsed;
+                }
+            }
+            return KorkApi::AstEnumerationContinue;
+        }
+
         switch (info->nodeType) {
             case ASTNodeClassDeclStmt: {
                 const ClassDeclStmtNode *class_node = static_cast<const ClassDeclStmtNode *>(info->stmtNode);
@@ -872,6 +1051,9 @@ KorkApi::AstEnumerationControl collect_script_metadata_from_ast(void *user_ptr, 
                 if (class_node != nullptr && out->declared_script_class_parent_name.is_empty() && class_node->parentName != nullptr) {
                     out->declared_script_class_parent_name = String(class_node->parentName);
                 }
+                if (out->script_class_documentation.is_empty()) {
+                    out->script_class_documentation = consume_pending_doc(info->depth);
+                }
                 break;
             }
             case ASTNodeFunctionDeclStmt: {
@@ -879,6 +1061,8 @@ KorkApi::AstEnumerationControl collect_script_metadata_from_ast(void *user_ptr, 
                 if (function_node == nullptr || function_node->fnName == nullptr) {
                     break;
                 }
+
+                const String function_doc = consume_pending_doc(info->depth);
 
                 const String namespace_name = String(function_node->nameSpace).strip_edges();
                 if (out->inferred_namespace_name.is_empty() && !namespace_name.is_empty()) {
@@ -909,6 +1093,7 @@ KorkApi::AstEnumerationControl collect_script_metadata_from_ast(void *user_ptr, 
                         metadata.arguments.push_back(argument_metadata);
                     }
                     metadata.line = function_node->dbgLineNumber > 0 ? function_node->dbgLineNumber : -1;
+                    metadata.documentation = function_doc;
                     out->signal_metadata[method_key] = metadata;
                     break;
                 }
@@ -935,10 +1120,12 @@ KorkApi::AstEnumerationControl collect_script_metadata_from_ast(void *user_ptr, 
                 }
                 metadata.has_return_value = function_node->returnTypeName != nullptr || stmt_list_contains_return(function_node->stmts);
                 metadata.line = function_node->dbgLineNumber > 0 ? function_node->dbgLineNumber : -1;
+                metadata.documentation = function_doc;
                 out->method_metadata[method_key] = metadata;
                 break;
             }
             default:
+                out->pending_docblocks_by_depth.erase(info->depth);
                 break;
         }
     } else if (info->kind == KorkApi::AstEnumerationNodeScriptClassField) {
@@ -1143,8 +1330,11 @@ Ref<Script> KorkScript::_get_base_script() const {
 }
 
 StringName KorkScript::_get_global_name() const {
-    const String effective_namespace = get_effective_namespace_name();
-    return effective_namespace.is_empty() ? StringName() : StringName(effective_namespace);
+    ensure_method_cache_current();
+    if (!declared_script_class_name_.is_empty()) {
+        return StringName(declared_script_class_name_);
+    }
+    return StringName();
 }
 
 StringName KorkScript::_get_instance_base_type() const {
@@ -1208,12 +1398,81 @@ Error KorkScript::_reload(bool) {
 }
 
 StringName KorkScript::_get_doc_class_name() const {
-    const String effective_namespace = get_effective_namespace_name();
-    return effective_namespace.is_empty() ? StringName("KorkScript") : StringName(effective_namespace);
+    ensure_method_cache_current();
+    if (!declared_script_class_name_.is_empty()) {
+        return StringName(declared_script_class_name_);
+    }
+    if (!namespace_name_.is_empty()) {
+        return StringName(namespace_name_);
+    }
+    if (!inferred_namespace_name_.is_empty()) {
+        return StringName(inferred_namespace_name_);
+    }
+    return StringName("KorkScript");
 }
 
 TypedArray<Dictionary> KorkScript::_get_documentation() const {
-    return TypedArray<Dictionary>();
+    ensure_method_cache_current();
+    TypedArray<Dictionary> out;
+    Dictionary class_doc;
+    class_doc["name"] = String(_get_doc_class_name());
+    class_doc["brief_description"] = script_class_documentation_;
+
+    Array methods;
+    for (const std::string &method_name : method_order_) {
+        const auto found = method_metadata_.find(method_name);
+        if (found == method_metadata_.end()) {
+            continue;
+        }
+
+        Dictionary method_doc;
+        method_doc["name"] = String(method_name.c_str());
+        if (!found->second.documentation.is_empty()) {
+            method_doc["description"] = found->second.documentation;
+        }
+        method_doc["return_type"] = metadata_type_name(found->second.return_type, found->second.return_class_name);
+
+        Array arguments;
+        for (const MethodArgumentMetadata &argument : found->second.arguments) {
+            Dictionary argument_doc;
+            argument_doc["name"] = String(argument.name);
+            argument_doc["type"] = metadata_type_name(argument.type, argument.class_name);
+            arguments.push_back(argument_doc);
+        }
+        method_doc["arguments"] = arguments;
+        method_doc["params"] = arguments;
+        methods.push_back(method_doc);
+    }
+    class_doc["methods"] = methods;
+
+    Array signals;
+    for (const std::string &signal_name : signal_order_) {
+        const auto found = signal_metadata_.find(signal_name);
+        if (found == signal_metadata_.end()) {
+            continue;
+        }
+
+        Dictionary signal_doc;
+        signal_doc["name"] = String(signal_name.c_str());
+        if (!found->second.documentation.is_empty()) {
+            signal_doc["description"] = found->second.documentation;
+        }
+
+        Array arguments;
+        for (const MethodArgumentMetadata &argument : found->second.arguments) {
+            Dictionary argument_doc;
+            argument_doc["name"] = String(argument.name);
+            argument_doc["type"] = metadata_type_name(argument.type, argument.class_name);
+            arguments.push_back(argument_doc);
+        }
+        signal_doc["arguments"] = arguments;
+        signal_doc["params"] = arguments;
+        signals.push_back(signal_doc);
+    }
+    class_doc["signals"] = signals;
+
+    out.push_back(class_doc);
+    return out;
 }
 
 bool KorkScript::_has_method(const StringName &p_method) const {
@@ -1278,7 +1537,11 @@ Dictionary KorkScript::_get_method_info(const StringName &p_method) const {
         PropertyInfo property_info(argument.type, String(argument.name), PROPERTY_HINT_NONE, String(argument.class_name));
         method_info.arguments.push_back(property_info);
     }
-    return method_info.operator Dictionary();
+    Dictionary out = method_info.operator Dictionary();
+    if (!metadata->documentation.is_empty()) {
+        out["description"] = metadata->documentation;
+    }
+    return out;
 }
 
 bool KorkScript::_is_tool() const {
@@ -1530,6 +1793,7 @@ void KorkScript::refresh_method_cache() {
     inferred_namespace_name_ = std::move(metadata.inferred_namespace_name);
     declared_script_class_name_ = std::move(metadata.declared_script_class_name);
     declared_script_class_parent_name_ = std::move(metadata.declared_script_class_parent_name);
+    script_class_documentation_ = std::move(metadata.script_class_documentation);
     method_names_ = std::move(metadata.method_names);
     method_metadata_ = std::move(metadata.method_metadata);
     method_order_ = std::move(metadata.method_order);

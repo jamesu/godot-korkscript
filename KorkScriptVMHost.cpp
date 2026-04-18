@@ -911,12 +911,80 @@ bool KorkScriptVMHost::reload_known_scripts(const KorkScript *extra_script) {
     return true;
 }
 
+void KorkScriptVMHost::dedupe_known_scripts_for_path(const KorkScript *script) {
+    if (script == nullptr) {
+        return;
+    }
+
+    const String path = script->get_path();
+    if (path.is_empty()) {
+        return;
+    }
+
+    const uint64_t keep_key = reinterpret_cast<uint64_t>(script);
+    for (auto it = known_scripts_.begin(); it != known_scripts_.end();) {
+        if (it->first == keep_key) {
+            ++it;
+            continue;
+        }
+
+        auto active = active_scripts_.find(it->first);
+        if (active != active_scripts_.end() && active->second.ref_count > 0) {
+            ++it;
+            continue;
+        }
+
+        const Ref<KorkScript> &candidate = it->second;
+        if (candidate.is_null() || candidate->get_path() != path) {
+            ++it;
+            continue;
+        }
+
+        loaded_scripts_.erase(it->first);
+        it = known_scripts_.erase(it);
+    }
+}
+
+void KorkScriptVMHost::prune_script_caches(const KorkScript *preserve_script) {
+    std::unordered_set<uint64_t> keep_keys;
+    keep_keys.reserve(active_scripts_.size() + (preserve_script != nullptr ? 1 : 0));
+    for (const auto &entry : active_scripts_) {
+        if (entry.second.ref_count > 0) {
+            keep_keys.insert(entry.first);
+        }
+    }
+    if (preserve_script != nullptr) {
+        keep_keys.insert(reinterpret_cast<uint64_t>(preserve_script));
+    }
+
+    for (auto it = known_scripts_.begin(); it != known_scripts_.end();) {
+        if (keep_keys.find(it->first) == keep_keys.end()) {
+            loaded_scripts_.erase(it->first);
+            it = known_scripts_.erase(it);
+            continue;
+        }
+        ++it;
+    }
+
+    for (auto it = loaded_scripts_.begin(); it != loaded_scripts_.end();) {
+        if (keep_keys.find(it->first) == keep_keys.end()) {
+            it = loaded_scripts_.erase(it);
+            continue;
+        }
+        ++it;
+    }
+}
+
 bool KorkScriptVMHost::ensure_script_loaded(const KorkScript *script) {
     if (script == nullptr || vm_ == nullptr) {
         return false;
     }
 
     const uint64_t key = reinterpret_cast<uint64_t>(script);
+    dedupe_known_scripts_for_path(script);
+    if (known_scripts_.size() > 4096) {
+        prune_script_caches(script);
+    }
     known_scripts_[key] = Ref<KorkScript>(const_cast<KorkScript *>(script));
 
     if (reload_pending_) {
@@ -943,6 +1011,10 @@ void KorkScriptVMHost::notify_script_changed(const KorkScript *script) {
         return;
     }
 
+    dedupe_known_scripts_for_path(script);
+    if (known_scripts_.size() > 4096) {
+        prune_script_caches(script);
+    }
     known_scripts_[reinterpret_cast<uint64_t>(script)] = Ref<KorkScript>(const_cast<KorkScript *>(script));
     reload_pending_ = true;
 }
@@ -974,6 +1046,7 @@ void KorkScriptVMHost::release_script(const KorkScript *script) {
     }
 
     active_scripts_.erase(found);
+    known_scripts_.erase(key);
     loaded_scripts_.erase(key);
 }
 

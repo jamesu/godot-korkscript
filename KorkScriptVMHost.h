@@ -103,6 +103,8 @@ private:
     void reset_vm();
     bool eval_script_source(const KorkScript *script);
     bool reload_known_scripts(const KorkScript *extra_script = nullptr);
+    void prune_script_caches(const KorkScript *preserve_script = nullptr);
+    void dedupe_known_scripts_for_path(const KorkScript *script);
     void ensure_global_math_namespace();
     KorkApi::NamespaceId ensure_namespace_for_class(const StringName &class_name);
     KorkApi::ClassId ensure_class_for_godot_type(const StringName &class_name);

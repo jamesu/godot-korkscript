@@ -92,11 +92,13 @@ public:
         StringName return_class_name;
         bool has_return_value = false;
         int32_t line = -1;
+        String documentation;
     };
 
     struct SignalMetadata {
         std::vector<MethodArgumentMetadata> arguments;
         int32_t line = -1;
+        String documentation;
     };
 
     struct ClassFieldMetadata {
@@ -130,6 +132,7 @@ private:
     std::unordered_set<std::string> signal_names_;
     std::unordered_map<std::string, SignalMetadata> signal_metadata_;
     std::vector<std::string> signal_order_;
+    String script_class_documentation_;
     std::unordered_map<std::string, ClassFieldMetadata> class_field_metadata_;
     std::vector<std::string> class_field_order_;
     std::unordered_map<std::string, ClassFieldMetadata> previous_class_field_metadata_;
