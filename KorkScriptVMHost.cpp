@@ -2,6 +2,7 @@
 
 #include "KorkScript.h"
 #include "embed/compilerOpcodes.h"
+#include "ext/korkscript/engine/console/ast.h"
 
 #include <godot_cpp/classes/class_db_singleton.hpp>
 #include <godot_cpp/classes/node.hpp>
@@ -22,6 +23,7 @@
 
 #include <cstdio>
 #include <cmath>
+#include <cstring>
 #include <unordered_set>
 
 namespace godot {
@@ -78,6 +80,79 @@ PackedStringArray parse_usage_argument_names(const char *usage) {
     return out;
 }
 
+void add_referenced_type_name(std::unordered_set<std::string> &type_names, const char *type_name) {
+    if (type_name == nullptr) {
+        return;
+    }
+
+    const String normalized = String(type_name).strip_edges();
+    if (normalized.is_empty()) {
+        return;
+    }
+
+    const String lower = normalized.to_lower();
+    if (lower == "bool" ||
+            lower == "int" ||
+            lower == "float" ||
+            lower == "uint" ||
+            lower == "string" ||
+            lower == "vector2" ||
+            lower == "vector3" ||
+            lower == "vector4" ||
+            lower == "color") {
+        return;
+    }
+
+    const CharString utf8 = normalized.utf8();
+    type_names.emplace(utf8.get_data(), static_cast<size_t>(utf8.length()));
+}
+
+KorkApi::AstEnumerationControl collect_referenced_type_names(void *user_ptr, const KorkApi::AstEnumerationInfo *info) {
+    if (user_ptr == nullptr || info == nullptr) {
+        return KorkApi::AstEnumerationContinue;
+    }
+
+    std::unordered_set<std::string> &type_names = *static_cast<std::unordered_set<std::string> *>(user_ptr);
+    if (info->kind == KorkApi::AstEnumerationNodeStmt) {
+        if (info->nodeType == ASTNodeClassDeclStmt) {
+            const ClassDeclStmtNode *class_node = static_cast<const ClassDeclStmtNode *>(info->stmtNode);
+            if (class_node != nullptr) {
+                add_referenced_type_name(type_names, class_node->parentName);
+            }
+        } else if (info->nodeType == ASTNodeFunctionDeclStmt) {
+            const FunctionDeclStmtNode *function_node = static_cast<const FunctionDeclStmtNode *>(info->stmtNode);
+            if (function_node != nullptr) {
+                add_referenced_type_name(type_names, function_node->returnTypeName);
+                for (const VarNode *arg = function_node->args; arg != nullptr; arg = static_cast<const VarNode *>(arg->getNext())) {
+                    add_referenced_type_name(type_names, arg->varType);
+                }
+            }
+        } else if (info->nodeType == ASTNodeVar) {
+            const VarNode *var_node = static_cast<const VarNode *>(info->stmtNode);
+            if (var_node != nullptr) {
+                add_referenced_type_name(type_names, var_node->varType);
+            }
+        } else if (info->nodeType == ASTNodeAssignExpr) {
+            const AssignExprNode *assign_node = static_cast<const AssignExprNode *>(info->stmtNode);
+            if (assign_node != nullptr) {
+                add_referenced_type_name(type_names, assign_node->assignTypeName);
+            }
+        } else if (info->nodeType == ASTNodeSlotAssign) {
+            const SlotAssignNode *slot_assign_node = static_cast<const SlotAssignNode *>(info->stmtNode);
+            if (slot_assign_node != nullptr) {
+                add_referenced_type_name(type_names, slot_assign_node->varType);
+            }
+        }
+    } else if (info->kind == KorkApi::AstEnumerationNodeScriptClassField) {
+        const ScriptClassFieldDecl *field_node = info->scriptClassFieldNode;
+        if (field_node != nullptr) {
+            add_referenced_type_name(type_names, field_node->typeName);
+        }
+    }
+
+    return KorkApi::AstEnumerationContinue;
+}
+
 String format_component(double value) {
     char buffer[64];
     std::snprintf(buffer, sizeof(buffer), "%.9g", value);
@@ -98,6 +173,69 @@ bool parse_space_separated_components(const char *input, int expected_components
     if (expected_components == 4) {
         return std::sscanf(input, "%lf %lf %lf %lf", &out_values[0], &out_values[1], &out_values[2], &out_values[3]) == 4;
     }
+    return false;
+}
+
+bool cast_object_reference_type(void *,
+        KorkApi::Vm *vm,
+        KorkApi::TypeStorageInterface *input_storage,
+        KorkApi::TypeStorageInterface *output_storage,
+        void *,
+        BitSet32,
+        U32 requested_type) {
+    if (vm == nullptr || input_storage == nullptr || output_storage == nullptr) {
+        return false;
+    }
+
+    KorkApi::ConsoleValue input = input_storage->data.storageAddress;
+    if (input_storage->data.storageRegister != nullptr) {
+        input = *input_storage->data.storageRegister;
+    }
+    const U64 object_ref = static_cast<U64>(vm->valueAsInt(input));
+
+    if (requested_type == KorkApi::ConsoleValue::TypeInternalUnsigned) {
+        if (output_storage->data.storageRegister != nullptr) {
+            *output_storage->data.storageRegister = KorkApi::ConsoleValue::makeUnsigned(object_ref);
+            return true;
+        }
+        return false;
+    }
+
+    if (requested_type == KorkApi::ConsoleValue::TypeInternalNumber) {
+        if (output_storage->data.storageRegister != nullptr) {
+            *output_storage->data.storageRegister = KorkApi::ConsoleValue::makeNumber(static_cast<F64>(object_ref));
+            return true;
+        }
+        return false;
+    }
+
+    if (requested_type == KorkApi::ConsoleValue::TypeInternalString) {
+        const String text = String::num_uint64(object_ref);
+        const CharString utf8 = text.utf8();
+        output_storage->ResizeStorage(output_storage, static_cast<U32>(utf8.length() + 1));
+        char *dst = static_cast<char *>(output_storage->data.storageAddress.evaluatePtr(vm->getAllocBase()));
+        if (dst == nullptr) {
+            return false;
+        }
+        memcpy(dst, utf8.get_data(), static_cast<size_t>(utf8.length() + 1));
+        if (output_storage->data.storageRegister != nullptr) {
+            *output_storage->data.storageRegister = output_storage->data.storageAddress;
+        }
+        return true;
+    }
+
+    if (requested_type >= KorkApi::ConsoleValue::TypeBeginCustom) {
+        if (output_storage->data.storageRegister != nullptr) {
+            *output_storage->data.storageRegister = KorkApi::ConsoleValue::makeRaw(object_ref, static_cast<U16>(requested_type), KorkApi::ConsoleValue::ZoneExternal);
+        }
+
+        void *dst_ptr = output_storage->data.storageAddress.evaluatePtr(vm->getAllocBase());
+        if (dst_ptr != nullptr) {
+            *static_cast<U64 *>(dst_ptr) = object_ref;
+        }
+        return true;
+    }
+
     return false;
 }
 
@@ -662,6 +800,7 @@ void KorkScriptVMHost::reset_vm() {
     }
 
     godot_class_ids_by_name_.clear();
+    godot_type_ids_by_name_.clear();
     vm_objects_by_owner_id_.clear();
     vm_objects_by_id_.clear();
     vm_objects_by_name_.clear();
@@ -680,13 +819,32 @@ bool KorkScriptVMHost::eval_script_source(const KorkScript *script) {
 
     const String base_type = script->get_base_type();
     if (!base_type.is_empty()) {
+        ensure_type_for_godot_type(base_type);
         ensure_class_for_godot_type(base_type);
     }
 
     const String source_code = script->get_source_code_ref();
     const String declared_parent = script->get_declared_script_class_parent_name().strip_edges();
     if (!declared_parent.is_empty()) {
+        ensure_type_for_godot_type(declared_parent);
         ensure_class_for_godot_type(declared_parent);
+    }
+    {
+        std::unordered_set<std::string> referenced_type_names;
+        const CharString source_utf8_for_ast = source_code.utf8();
+        constexpr const char *kAstSourceName = "[KorkScriptTypeScan]";
+        const KorkApi::AstEnumerationResult ast_result = vm_->enumerateAst(
+                source_utf8_for_ast.get_data(),
+                kAstSourceName,
+                &referenced_type_names,
+                &collect_referenced_type_names,
+                nullptr);
+        if (ast_result == KorkApi::AstEnumerationCompleted) {
+            for (const std::string &type_name : referenced_type_names) {
+                ensure_type_for_godot_type(StringName(type_name.c_str()));
+                ensure_class_for_godot_type(StringName(type_name.c_str()));
+            }
+        }
     }
 
     const CharString source_utf8 = source_code.utf8();
@@ -709,16 +867,43 @@ bool KorkScriptVMHost::eval_script_source(const KorkScript *script) {
 }
 
 bool KorkScriptVMHost::reload_known_scripts(const KorkScript *extra_script) {
+    std::vector<Ref<KorkScript>> pending;
+    pending.reserve(known_scripts_.size() + (extra_script != nullptr ? 1 : 0));
+
     for (const auto &entry : known_scripts_) {
-        const Ref<KorkScript> &script_ref = entry.second;
-        if (!script_ref.is_valid() || !eval_script_source(script_ref.ptr())) {
-            return false;
+        if (entry.second.is_valid()) {
+            pending.push_back(entry.second);
         }
     }
 
     if (extra_script != nullptr) {
         const uint64_t key = reinterpret_cast<uint64_t>(extra_script);
-        if (known_scripts_.find(key) == known_scripts_.end() && !eval_script_source(extra_script)) {
+        if (known_scripts_.find(key) == known_scripts_.end()) {
+            pending.push_back(Ref<KorkScript>(const_cast<KorkScript *>(extra_script)));
+        }
+    }
+
+    while (!pending.empty()) {
+        bool progress = false;
+        for (size_t i = 0; i < pending.size();) {
+            const Ref<KorkScript> &script_ref = pending[i];
+            if (script_ref.is_null()) {
+                pending.erase(pending.begin() + static_cast<int64_t>(i));
+                continue;
+            }
+
+            if (eval_script_source(script_ref.ptr())) {
+                pending.erase(pending.begin() + static_cast<int64_t>(i));
+                progress = true;
+                continue;
+            }
+
+            ++i;
+        }
+
+        if (!pending.empty() && !progress) {
+            // Force one last failing evaluation to keep the most relevant error in the VM log.
+            eval_script_source(pending.front().ptr());
             return false;
         }
     }
@@ -1521,16 +1706,48 @@ KorkApi::ClassId KorkScriptVMHost::resolve_vm_object_class(Object *owner, const 
         return godot_object_class_id_;
     }
 
-    const String script_namespace_name = script->get_effective_namespace_name();
+    String script_namespace_name = script->get_effective_namespace_name().strip_edges();
+    const String declared_script_class_name = script->get_declared_script_class_name().strip_edges();
+    if (script_namespace_name.is_empty() && !declared_script_class_name.is_empty()) {
+        script_namespace_name = declared_script_class_name;
+    }
     if (script_namespace_name.is_empty()) {
         return godot_object_class_id_;
     }
 
-    const std::string namespace_utf8 = intern_utf8(script_namespace_name);
-    KorkApi::NamespaceId script_ns = vm_->findNamespace(vm_->internString(namespace_utf8.c_str()));
-    install_object_bridge_methods(script_ns, false);
+    auto resolve_namespace = [&](const String &name, KorkApi::NamespaceId &out_ns, KorkApi::ClassId &out_class_id) {
+        if (name.is_empty()) {
+            out_ns = nullptr;
+            out_class_id = -1;
+            return;
+        }
+        const std::string name_utf8 = intern_utf8(name);
+        out_ns = vm_->findNamespace(vm_->internString(name_utf8.c_str()));
+        out_class_id = vm_->getClassId(name_utf8.c_str());
+    };
 
-    const KorkApi::ClassId script_class_id = vm_->getClassId(namespace_utf8.c_str());
+    KorkApi::NamespaceId script_ns = nullptr;
+    KorkApi::ClassId script_class_id = -1;
+    resolve_namespace(script_namespace_name, script_ns, script_class_id);
+    if (script_class_id < 0 && !declared_script_class_name.is_empty() && declared_script_class_name != script_namespace_name) {
+        KorkApi::NamespaceId declared_ns = nullptr;
+        KorkApi::ClassId declared_class_id = -1;
+        resolve_namespace(declared_script_class_name, declared_ns, declared_class_id);
+        if (declared_ns != nullptr) {
+            script_namespace_name = declared_script_class_name;
+            script_ns = declared_ns;
+            script_class_id = declared_class_id;
+        }
+    }
+
+    if (script_ns == nullptr) {
+        UtilityFunctions::push_error(vformat(
+                "Kork namespace '%s' was not found while binding script to owner '%s'.",
+                script_namespace_name,
+                String(owner->get_class())));
+        return -1;
+    }
+    install_object_bridge_methods(script_ns, false);
     if (script_class_id >= 0) {
         bool matches_owner_linkage = false;
         for (StringName current_class = owner->get_class(); !current_class.is_empty(); current_class = ClassDBSingleton::get_singleton()->get_parent_class(current_class)) {
@@ -1981,21 +2198,41 @@ KorkApi::ClassId KorkScriptVMHost::ensure_class_for_godot_type(const StringName 
         return -1;
     }
 
-    const std::string class_utf8 = intern_utf8(class_name);
+    StringName resolved_class_name = class_name;
+    ClassDBSingleton *class_db = ClassDBSingleton::get_singleton();
+    if (class_db == nullptr) {
+        return -1;
+    }
+
+    if (!class_db->class_exists(resolved_class_name)) {
+        const String requested = String(resolved_class_name);
+        const PackedStringArray all_classes = class_db->get_class_list();
+        for (int i = 0; i < all_classes.size(); ++i) {
+            const String candidate = all_classes[i];
+            if (candidate.nocasecmp_to(requested) == 0) {
+                resolved_class_name = StringName(candidate);
+                break;
+            }
+        }
+    }
+
+    if (!class_db->class_exists(resolved_class_name)) {
+        return -1;
+    }
+
+    ensure_type_for_godot_type(resolved_class_name);
+
+    const std::string class_utf8 = intern_utf8(resolved_class_name);
     auto found = godot_class_ids_by_name_.find(class_utf8);
     if (found != godot_class_ids_by_name_.end()) {
         return found->second;
     }
 
-    if (!ClassDB::class_exists(class_name)) {
-        return -1;
-    }
-
     KorkApi::ClassId parent_class_id = -1;
-    const StringName parent_name = ClassDBSingleton::get_singleton()->get_parent_class(class_name);
+    const StringName parent_name = class_db->get_parent_class(resolved_class_name);
     if (!parent_name.is_empty()) {
         parent_class_id = ensure_class_for_godot_type(parent_name);
-    } else if (class_name == StringName("Object")) {
+    } else if (resolved_class_name == StringName("Object")) {
         parent_class_id = godot_object_class_id_;
     }
 
@@ -2036,6 +2273,33 @@ KorkApi::ClassId KorkScriptVMHost::ensure_class_for_godot_type(const StringName 
     const KorkApi::ClassId class_id = vm_->registerClass(class_info);
     godot_class_ids_by_name_.emplace(class_utf8, class_id);
     return class_id;
+}
+
+KorkApi::TypeId KorkScriptVMHost::ensure_type_for_godot_type(const StringName &type_name) {
+    if (vm_ == nullptr || type_name.is_empty()) {
+        return -1;
+    }
+
+    const std::string type_utf8 = intern_utf8(type_name);
+    auto found = godot_type_ids_by_name_.find(type_utf8);
+    if (found != godot_type_ids_by_name_.end()) {
+        return found->second;
+    }
+
+    KorkApi::TypeInfo type_info{};
+    type_info.name = vm_->internString(type_utf8.c_str());
+    type_info.inspectorFieldType = nullptr;
+    type_info.userPtr = nullptr;
+    type_info.fieldSize = sizeof(U64);
+    type_info.valueSize = sizeof(U64);
+    type_info.iFuncs.CastValueFn = &cast_object_reference_type;
+    type_info.iFuncs.PerformOpFn = [](void *, KorkApi::Vm *, U32, KorkApi::ConsoleValue lhs, KorkApi::ConsoleValue) {
+        return lhs;
+    };
+
+    const KorkApi::TypeId type_id = vm_->registerType(type_info);
+    godot_type_ids_by_name_.emplace(type_utf8, type_id);
+    return type_id;
 }
 
 void KorkScriptVMHost::install_object_bridge_methods(KorkApi::NamespaceId ns_id, bool include_script_ctor) {

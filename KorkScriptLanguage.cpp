@@ -28,6 +28,18 @@ struct FunctionEntry {
     int32_t line = -1;
 };
 
+struct LookupMetadata {
+    String script_namespace_name;
+    String script_class_name;
+    String script_parent_name;
+    int32_t script_class_line = -1;
+    std::unordered_map<std::string, int32_t> scoped_functions;
+    std::unordered_map<std::string, int32_t> scoped_signals;
+    std::unordered_map<std::string, int32_t> global_functions;
+    std::unordered_map<std::string, int32_t> global_signals;
+    std::unordered_map<std::string, int32_t> class_fields;
+};
+
 struct ScriptCompletionMetadata {
     bool parse_succeeded = false;
     String script_class_name;
@@ -122,6 +134,11 @@ struct CallHintContext {
     String target;
     String method_name;
     int argument_index = 0;
+};
+
+struct LookupTargetContext {
+    bool has_member_target = false;
+    String target;
 };
 
 MemberCompletionContext extract_member_completion_context(const String &before_cursor) {
@@ -258,6 +275,129 @@ CallHintContext extract_call_hint_context(const String &before_cursor) {
     }
 
     return ctx;
+}
+
+LookupTargetContext extract_lookup_target_context(const String &before_cursor) {
+    LookupTargetContext ctx;
+    const MemberCompletionContext member_ctx = extract_member_completion_context(before_cursor);
+    if (member_ctx.valid) {
+        ctx.has_member_target = true;
+        ctx.target = member_ctx.target;
+    }
+    return ctx;
+}
+
+String normalize_lookup_symbol(const String &symbol) {
+    return symbol.strip_edges();
+}
+
+String bare_lookup_symbol(const String &symbol) {
+    const String normalized = normalize_lookup_symbol(symbol);
+    if (normalized.begins_with("%") || normalized.begins_with("$")) {
+        return normalized.substr(1);
+    }
+    return normalized;
+}
+
+bool symbol_matches_lookup_name(const String &candidate, const String &symbol) {
+    const String normalized_candidate = normalize_lookup_symbol(candidate);
+    const String normalized_symbol = normalize_lookup_symbol(symbol);
+    if (normalized_candidate == normalized_symbol) {
+        return true;
+    }
+    return bare_lookup_symbol(normalized_candidate) == bare_lookup_symbol(normalized_symbol);
+}
+
+int32_t find_variable_definition_line(const String &code, const String &symbol, int cursor_offset) {
+    const String target = normalize_lookup_symbol(symbol);
+    if (target.is_empty()) {
+        return -1;
+    }
+
+    const PackedStringArray lines = code.left(cursor_offset >= 0 ? cursor_offset : code.length()).split("\n", false);
+    for (int line_idx = lines.size() - 1; line_idx >= 0; --line_idx) {
+        const String &line = lines[line_idx];
+        int search_from = 0;
+        while (true) {
+            const int pos = line.find(target, search_from);
+            if (pos < 0) {
+                break;
+            }
+
+            const int before = pos - 1;
+            const int after = pos + target.length();
+            const bool left_ok = before < 0 || !is_completion_identifier_char(line[before]);
+            const bool right_ok = after >= line.length() || !is_completion_identifier_char(line[after]);
+            if (left_ok && right_ok) {
+                int cursor = after;
+                while (cursor < line.length() && line[cursor] == ' ') {
+                    ++cursor;
+                }
+
+                const bool looks_like_assignment = cursor < line.length() && (line[cursor] == ':' || line[cursor] == '=');
+                const bool looks_like_param = line.find("function") >= 0 || line.find("signal") >= 0;
+                if (looks_like_assignment || looks_like_param) {
+                    return line_idx + 1;
+                }
+            }
+
+            search_from = pos + target.length();
+        }
+    }
+
+    return -1;
+}
+
+bool lookup_godot_class_member(const StringName &class_name, const String &symbol, Dictionary &result) {
+    ClassDBSingleton *class_db = ClassDBSingleton::get_singleton();
+    if (class_db == nullptr || class_name.is_empty() || !class_db->class_exists(class_name)) {
+        return false;
+    }
+
+    const String member = bare_lookup_symbol(symbol);
+
+    StringName current = class_name;
+    while (!current.is_empty() && class_db->class_exists(current)) {
+        const TypedArray<Dictionary> properties = class_db->class_get_property_list(current);
+        for (int i = 0; i < properties.size(); ++i) {
+            const Dictionary property = properties[i];
+            if (String(property.get("name", "")).strip_edges() == member) {
+                result["result"] = static_cast<int64_t>(OK);
+                result["type"] = static_cast<int64_t>(KorkScriptLanguage::LOOKUP_RESULT_CLASS_PROPERTY);
+                result["class_name"] = String(current);
+                result["class_member"] = member;
+                return true;
+            }
+        }
+
+        const TypedArray<Dictionary> methods = class_db->class_get_method_list(current);
+        for (int i = 0; i < methods.size(); ++i) {
+            const Dictionary method = methods[i];
+            if (String(method.get("name", "")).strip_edges() == member) {
+                result["result"] = static_cast<int64_t>(OK);
+                result["type"] = static_cast<int64_t>(KorkScriptLanguage::LOOKUP_RESULT_CLASS_METHOD);
+                result["class_name"] = String(current);
+                result["class_member"] = member;
+                return true;
+            }
+        }
+
+        const TypedArray<Dictionary> signals = class_db->class_get_signal_list(current);
+        for (int i = 0; i < signals.size(); ++i) {
+            const Dictionary signal = signals[i];
+            if (String(signal.get("name", "")).strip_edges() == member) {
+                result["result"] = static_cast<int64_t>(OK);
+                result["type"] = static_cast<int64_t>(KorkScriptLanguage::LOOKUP_RESULT_CLASS_SIGNAL);
+                result["class_name"] = String(current);
+                result["class_member"] = member;
+                return true;
+            }
+        }
+
+        current = ClassDB::get_parent_class(current);
+    }
+
+    return false;
 }
 
 String find_explicit_type_for_variable(const String &code_before_cursor, const String &variable_name) {
@@ -400,6 +540,70 @@ KorkApi::AstEnumerationControl collect_completion_metadata(void *user_ptr, const
     return KorkApi::AstEnumerationContinue;
 }
 
+KorkApi::AstEnumerationControl collect_lookup_metadata(void *user_ptr, const KorkApi::AstEnumerationInfo *info) {
+    if (user_ptr == nullptr || info == nullptr) {
+        return KorkApi::AstEnumerationContinue;
+    }
+
+    LookupMetadata *out = static_cast<LookupMetadata *>(user_ptr);
+    if (info->kind == KorkApi::AstEnumerationNodeStmt) {
+        if (info->nodeType == ASTNodeClassDeclStmt) {
+            const ClassDeclStmtNode *class_node = static_cast<const ClassDeclStmtNode *>(info->stmtNode);
+            if (class_node != nullptr && class_node->className != nullptr) {
+                out->script_class_name = String(class_node->className).strip_edges();
+                out->script_namespace_name = out->script_class_name;
+                out->script_class_line = class_node->dbgLineNumber > 0 ? class_node->dbgLineNumber : -1;
+                if (class_node->parentName != nullptr) {
+                    out->script_parent_name = String(class_node->parentName).strip_edges();
+                }
+            }
+        } else if (info->nodeType == ASTNodeFunctionDeclStmt) {
+            const FunctionDeclStmtNode *function_node = static_cast<const FunctionDeclStmtNode *>(info->stmtNode);
+            if (function_node == nullptr || function_node->fnName == nullptr) {
+                return KorkApi::AstEnumerationContinue;
+            }
+
+            const String name = String(function_node->fnName).strip_edges();
+            if (name.is_empty()) {
+                return KorkApi::AstEnumerationContinue;
+            }
+
+            const String namespace_name = function_node->nameSpace != nullptr ? String(function_node->nameSpace).strip_edges() : String();
+            if (out->script_namespace_name.is_empty() && !namespace_name.is_empty()) {
+                out->script_namespace_name = namespace_name;
+            }
+
+            const std::string key = name.utf8().get_data();
+            const int32_t line = function_node->dbgLineNumber > 0 ? function_node->dbgLineNumber : -1;
+            const bool is_global_scope = namespace_name.is_empty();
+            const bool is_script_scope = !namespace_name.is_empty() && namespace_name == out->script_namespace_name;
+            if (function_node->isSignal) {
+                if (is_script_scope) {
+                    out->scoped_signals[key] = line;
+                } else if (is_global_scope) {
+                    out->global_signals[key] = line;
+                }
+            } else {
+                if (is_script_scope) {
+                    out->scoped_functions[key] = line;
+                } else if (is_global_scope) {
+                    out->global_functions[key] = line;
+                }
+            }
+        }
+    } else if (info->kind == KorkApi::AstEnumerationNodeScriptClassField) {
+        const ScriptClassFieldDecl *field_node = info->scriptClassFieldNode;
+        if (field_node != nullptr && field_node->fieldName != nullptr) {
+            const String field_name = String(field_node->fieldName).strip_edges();
+            if (!field_name.is_empty()) {
+                out->class_fields[field_name.utf8().get_data()] = field_node->dbgLineNumber > 0 ? field_node->dbgLineNumber : -1;
+            }
+        }
+    }
+
+    return KorkApi::AstEnumerationContinue;
+}
+
 ScriptCompletionMetadata scan_completion_metadata(KorkScriptVMHost *host, const String &code) {
     ScriptCompletionMetadata metadata;
     if (host == nullptr) {
@@ -412,6 +616,26 @@ ScriptCompletionMetadata scan_completion_metadata(KorkScriptVMHost *host, const 
             &collect_completion_metadata,
             nullptr);
     metadata.parse_succeeded = parse_result == KorkApi::AstEnumerationCompleted;
+    return metadata;
+}
+
+LookupMetadata scan_lookup_metadata(KorkScriptVMHost *host, const String &code, bool *r_parse_succeeded = nullptr) {
+    LookupMetadata metadata;
+    if (r_parse_succeeded != nullptr) {
+        *r_parse_succeeded = false;
+    }
+    if (host == nullptr) {
+        return metadata;
+    }
+    const KorkApi::AstEnumerationResult parse_result = host->enumerate_ast(
+            code,
+            String("[KorkScriptLanguageLookup]"),
+            &metadata,
+            &collect_lookup_metadata,
+            nullptr);
+    if (r_parse_succeeded != nullptr) {
+        *r_parse_succeeded = parse_result == KorkApi::AstEnumerationCompleted;
+    }
     return metadata;
 }
 
@@ -1438,10 +1662,119 @@ Dictionary KorkScriptLanguage::_complete_code(const String &p_code, const String
     return result;
 }
 
-Dictionary KorkScriptLanguage::_lookup_code(const String &, const String &, const String &, Object *) const {
+Dictionary KorkScriptLanguage::_lookup_code(const String &p_code, const String &p_symbol, const String &p_path, Object *p_owner) const {
     Dictionary result;
     result["result"] = ERR_UNAVAILABLE;
     result["type"] = LOOKUP_RESULT_MAX;
+    if (p_symbol.is_empty()) {
+        return result;
+    }
+
+    const String cursor_token = String::chr(0xFFFF);
+    const int cursor = p_code.find(cursor_token);
+    const String code_without_cursor = cursor >= 0 ? (p_code.substr(0, cursor) + p_code.substr(cursor + cursor_token.length())) : p_code;
+    const String before_cursor = cursor >= 0 ? p_code.substr(0, cursor) : p_code;
+
+    KorkScriptVMHost *host = const_cast<KorkScriptLanguage *>(this)->get_vm_host(String("default"));
+    bool parse_succeeded = false;
+    LookupMetadata metadata = scan_lookup_metadata(host, code_without_cursor, &parse_succeeded);
+    if (!parse_succeeded) {
+        const Ref<KorkScript> script = load_kork_script_resource(p_path);
+        if (script.is_valid()) {
+            metadata = scan_lookup_metadata(host, script->get_source_code_ref(), &parse_succeeded);
+        }
+    }
+
+    if (!parse_succeeded) {
+        return result;
+    }
+
+    const String normalized_symbol = normalize_lookup_symbol(p_symbol);
+    const std::string symbol_key = bare_lookup_symbol(normalized_symbol).utf8().get_data();
+    if (symbol_key.empty()) {
+        return result;
+    }
+
+    int32_t location = -1;
+    const LookupTargetContext target_ctx = extract_lookup_target_context(before_cursor);
+
+    if (symbol_matches_lookup_name(metadata.script_class_name, normalized_symbol) && metadata.script_class_line > 0) {
+        location = metadata.script_class_line;
+    } else if (target_ctx.has_member_target) {
+        const auto lookup_scoped_script_symbol = [&]() {
+            const auto field_found = metadata.class_fields.find(symbol_key);
+            if (field_found != metadata.class_fields.end()) {
+                return field_found->second;
+            }
+            const auto method_found = metadata.scoped_functions.find(symbol_key);
+            if (method_found != metadata.scoped_functions.end()) {
+                return method_found->second;
+            }
+            const auto signal_found = metadata.scoped_signals.find(symbol_key);
+            if (signal_found != metadata.scoped_signals.end()) {
+                return signal_found->second;
+            }
+            return -1;
+        };
+
+        if (target_ctx.target == "%this") {
+            location = lookup_scoped_script_symbol();
+            if (location < 0) {
+                const StringName godot_type = !metadata.script_parent_name.is_empty() ? StringName(metadata.script_parent_name) : StringName(p_owner != nullptr ? p_owner->get_class() : String("Node"));
+                if (lookup_godot_class_member(godot_type, normalized_symbol, result)) {
+                    return result;
+                }
+            }
+        } else {
+            const String explicit_type = find_explicit_type_for_variable(before_cursor, target_ctx.target);
+            if (!explicit_type.is_empty() && explicit_type == metadata.script_class_name) {
+                location = lookup_scoped_script_symbol();
+                if (location < 0) {
+                    const StringName godot_type = !metadata.script_parent_name.is_empty() ? StringName(metadata.script_parent_name) : StringName(p_owner != nullptr ? p_owner->get_class() : String("Node"));
+                    if (lookup_godot_class_member(godot_type, normalized_symbol, result)) {
+                        return result;
+                    }
+                }
+            } else if (!explicit_type.is_empty()) {
+                if (lookup_godot_class_member(StringName(explicit_type), normalized_symbol, result)) {
+                    return result;
+                }
+            }
+        }
+    } else {
+        const auto global_function = metadata.global_functions.find(symbol_key);
+        if (global_function != metadata.global_functions.end()) {
+            location = global_function->second;
+        }
+        if (location < 0) {
+            const auto global_signal = metadata.global_signals.find(symbol_key);
+            if (global_signal != metadata.global_signals.end()) {
+                location = global_signal->second;
+            }
+        }
+        if (location < 0 && (normalized_symbol.begins_with("%") || normalized_symbol.begins_with("$"))) {
+            location = find_variable_definition_line(code_without_cursor, normalized_symbol, cursor);
+            if (location > 0) {
+                result["result"] = static_cast<int64_t>(OK);
+                result["type"] = static_cast<int64_t>(LOOKUP_RESULT_LOCAL_VARIABLE);
+                result["script_path"] = p_path;
+                result["location"] = location;
+                result["description"] = normalized_symbol;
+                result["doc_type"] = "Variant";
+                result["value"] = "";
+                return result;
+            }
+        }
+    }
+
+    if (location <= 0) {
+        return result;
+    }
+
+    result["result"] = static_cast<int64_t>(OK);
+    result["type"] = static_cast<int64_t>(LOOKUP_RESULT_SCRIPT_LOCATION);
+    result["script_path"] = p_path;
+    result["location"] = location;
     return result;
 }
 

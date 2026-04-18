@@ -791,7 +791,8 @@ KorkScript::KorkScript() :
         declared_script_class_parent_name_(""),
         base_type_("Node"),
         tool_enabled_(false),
-        revision_(1) {
+        revision_(1),
+        method_cache_revision_(0) {
 }
 
 KorkScript::~KorkScript() {
@@ -861,14 +862,17 @@ const String &KorkScript::get_source_code_ref() const {
 }
 
 const String &KorkScript::get_declared_script_class_parent_name() const {
+    ensure_method_cache_current();
     return declared_script_class_parent_name_;
 }
 
 String KorkScript::get_declared_script_class_name() const {
+    ensure_method_cache_current();
     return declared_script_class_name_;
 }
 
 bool KorkScript::has_declared_script_class() const {
+    ensure_method_cache_current();
     return !declared_script_class_name_.is_empty();
 }
 
@@ -877,6 +881,7 @@ bool KorkScript::get_tool_enabled() const {
 }
 
 String KorkScript::get_effective_namespace_name() const {
+    ensure_method_cache_current();
     if (!namespace_name_.is_empty()) {
         return namespace_name_;
     }
@@ -891,6 +896,7 @@ uint64_t KorkScript::get_revision() const {
 }
 
 bool KorkScript::has_method_name(const StringName &method) const {
+    ensure_method_cache_current();
     return method_names_.find(string_name_key(method)) != method_names_.end();
 }
 
@@ -899,6 +905,7 @@ bool KorkScript::is_tool_enabled() const {
 }
 
 bool KorkScript::has_class_field(const StringName &field) const {
+    ensure_method_cache_current();
     return get_class_field_metadata(field) != nullptr;
 }
 
@@ -933,6 +940,7 @@ bool KorkScript::get_previous_class_field_default_value(const StringName &field,
 }
 
 PackedStringArray KorkScript::get_class_field_names() const {
+    ensure_method_cache_current();
     PackedStringArray out;
     for (const std::string &field_name : class_field_order_) {
         const auto found = class_field_metadata_.find(field_name);
@@ -1351,24 +1359,36 @@ void KorkScript::refresh_method_cache() {
     signal_order_ = std::move(metadata.signal_order);
     class_field_metadata_ = std::move(metadata.class_field_metadata);
     class_field_order_ = std::move(metadata.class_field_order);
+    method_cache_revision_ = revision_;
+}
+
+void KorkScript::ensure_method_cache_current() const {
+    if (method_cache_revision_ == revision_) {
+        return;
+    }
+    const_cast<KorkScript *>(this)->refresh_method_cache();
 }
 
 const KorkScript::MethodMetadata *KorkScript::get_method_metadata(const StringName &method) const {
+    ensure_method_cache_current();
     const auto found = method_metadata_.find(string_name_key(method));
     return found != method_metadata_.end() ? &found->second : nullptr;
 }
 
 const KorkScript::SignalMetadata *KorkScript::get_signal_metadata(const StringName &signal) const {
+    ensure_method_cache_current();
     const auto found = signal_metadata_.find(string_name_key(signal));
     return found != signal_metadata_.end() ? &found->second : nullptr;
 }
 
 const KorkScript::ClassFieldMetadata *KorkScript::get_class_field_metadata(const StringName &field) const {
+    ensure_method_cache_current();
     const auto found = class_field_metadata_.find(string_name_key(field));
     return found != class_field_metadata_.end() ? &found->second : nullptr;
 }
 
 const KorkScript::ClassFieldMetadata *KorkScript::get_previous_class_field_metadata(const StringName &field) const {
+    ensure_method_cache_current();
     const auto found = previous_class_field_metadata_.find(string_name_key(field));
     return found != previous_class_field_metadata_.end() ? &found->second : nullptr;
 }

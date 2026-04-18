@@ -106,6 +106,7 @@ private:
     void ensure_global_math_namespace();
     KorkApi::NamespaceId ensure_namespace_for_class(const StringName &class_name);
     KorkApi::ClassId ensure_class_for_godot_type(const StringName &class_name);
+    KorkApi::TypeId ensure_type_for_godot_type(const StringName &type_name);
     void install_object_bridge_methods(KorkApi::NamespaceId ns_id, bool include_script_ctor = false);
     void ensure_object_bridge_namespace();
     bool has_godot_property(Object *owner, const StringName &property) const;
@@ -192,6 +193,7 @@ private:
     std::unordered_map<std::string, KorkApi::VMObject *> vm_objects_by_name_;
     std::unordered_map<std::string, KorkApi::VMObject *> vm_objects_by_path_;
     std::unordered_map<std::string, KorkApi::ClassId> godot_class_ids_by_name_;
+    std::unordered_map<std::string, KorkApi::TypeId> godot_type_ids_by_name_;
     std::unordered_map<uint64_t, DynamicFieldState> dynamic_fields_by_owner_id_;
     std::unordered_map<uint64_t, ActiveScriptState> active_scripts_;
     std::unordered_map<uint64_t, Ref<KorkScript>> known_scripts_;

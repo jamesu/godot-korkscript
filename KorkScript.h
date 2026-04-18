@@ -109,6 +109,7 @@ public:
 private:
     void assign_source_code(const String &source, bool notify_language, bool emit_changed_signal);
     void refresh_method_cache();
+    void ensure_method_cache_current() const;
     const MethodMetadata *get_method_metadata(const StringName &method) const;
     const SignalMetadata *get_signal_metadata(const StringName &signal) const;
     const ClassFieldMetadata *get_class_field_metadata(const StringName &field) const;
@@ -132,6 +133,7 @@ private:
     std::unordered_map<std::string, ClassFieldMetadata> class_field_metadata_;
     std::vector<std::string> class_field_order_;
     std::unordered_map<std::string, ClassFieldMetadata> previous_class_field_metadata_;
+    mutable uint64_t method_cache_revision_;
 };
 
 } // namespace godot
