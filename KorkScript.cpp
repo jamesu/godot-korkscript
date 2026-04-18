@@ -152,7 +152,44 @@ struct ScriptPropertyListAllocation {
     uint32_t count = 0;
 };
 
+struct ScriptMethodListAllocation {
+    GDExtensionMethodInfo *infos = nullptr;
+    StringName *method_names = nullptr;
+    GDExtensionPropertyInfo *return_infos = nullptr;
+    StringName *return_names = nullptr;
+    StringName *return_class_names = nullptr;
+    String *return_hint_strings = nullptr;
+    GDExtensionPropertyInfo *argument_infos = nullptr;
+    StringName *argument_names = nullptr;
+    StringName *argument_class_names = nullptr;
+    String *argument_hint_strings = nullptr;
+    Variant *default_values = nullptr;
+    GDExtensionVariantPtr *default_value_ptrs = nullptr;
+    uint32_t method_count = 0;
+    uint32_t argument_count = 0;
+    uint32_t default_count = 0;
+};
+
 std::unordered_map<const GDExtensionPropertyInfo *, ScriptPropertyListAllocation> g_script_property_lists;
+std::unordered_map<const GDExtensionMethodInfo *, ScriptMethodListAllocation> g_script_method_lists;
+
+void fill_property_info_from_dictionary(
+        const Dictionary &source,
+        GDExtensionPropertyInfo &out_info,
+        StringName &out_name,
+        StringName &out_class_name,
+        String &out_hint_string,
+        const String &fallback_name = String()) {
+    out_name = StringName(source.get("name", fallback_name));
+    out_class_name = StringName(source.get("class_name", ""));
+    out_hint_string = String(source.get("hint_string", ""));
+    out_info.type = static_cast<GDExtensionVariantType>(static_cast<int64_t>(source.get("type", static_cast<int64_t>(Variant::NIL))));
+    out_info.name = &out_name;
+    out_info.class_name = &out_class_name;
+    out_info.hint = static_cast<uint32_t>(static_cast<int64_t>(source.get("hint", static_cast<int64_t>(PROPERTY_HINT_NONE))));
+    out_info.hint_string = &out_hint_string;
+    out_info.usage = static_cast<uint32_t>(static_cast<int64_t>(source.get("usage", static_cast<int64_t>(PROPERTY_USAGE_DEFAULT))));
+}
 
 bool is_editor_lifecycle_method(const StringName &name) {
     return name == StringName("_ready") ||
@@ -358,12 +395,138 @@ GDExtensionObjectPtr instance_get_owner(GDExtensionScriptInstanceDataPtr p_insta
     return instance != nullptr && instance->owner != nullptr ? instance->owner->_owner : nullptr;
 }
 
-const GDExtensionMethodInfo *instance_get_method_list(GDExtensionScriptInstanceDataPtr, uint32_t *r_count) {
+const GDExtensionMethodInfo *instance_get_method_list(GDExtensionScriptInstanceDataPtr p_instance, uint32_t *r_count) {
+    if (r_count == nullptr) {
+        return nullptr;
+    }
     *r_count = 0;
-    return nullptr;
+
+    KorkScriptInstance *instance = static_cast<KorkScriptInstance *>(p_instance);
+    if (instance == nullptr || !instance->script.is_valid()) {
+        return nullptr;
+    }
+    if (!sync_instance_vm_object(instance)) {
+        return nullptr;
+    }
+
+    const TypedArray<Dictionary> methods = instance->script->_get_script_method_list();
+    const uint32_t method_count = static_cast<uint32_t>(methods.size());
+    if (method_count == 0) {
+        return nullptr;
+    }
+
+    uint32_t total_argument_count = 0;
+    uint32_t total_default_count = 0;
+    for (uint32_t i = 0; i < method_count; ++i) {
+        const Dictionary method = methods[static_cast<int32_t>(i)];
+        total_argument_count += static_cast<uint32_t>(Array(method.get("args", Array())).size());
+        total_default_count += static_cast<uint32_t>(Array(method.get("default_args", Array())).size());
+    }
+
+    ScriptMethodListAllocation allocation;
+    allocation.method_count = method_count;
+    allocation.argument_count = total_argument_count;
+    allocation.default_count = total_default_count;
+    allocation.infos = memnew_arr(GDExtensionMethodInfo, method_count);
+    allocation.method_names = memnew_arr(StringName, method_count);
+    allocation.return_infos = memnew_arr(GDExtensionPropertyInfo, method_count);
+    allocation.return_names = memnew_arr(StringName, method_count);
+    allocation.return_class_names = memnew_arr(StringName, method_count);
+    allocation.return_hint_strings = memnew_arr(String, method_count);
+    if (total_argument_count > 0) {
+        allocation.argument_infos = memnew_arr(GDExtensionPropertyInfo, total_argument_count);
+        allocation.argument_names = memnew_arr(StringName, total_argument_count);
+        allocation.argument_class_names = memnew_arr(StringName, total_argument_count);
+        allocation.argument_hint_strings = memnew_arr(String, total_argument_count);
+    }
+    if (total_default_count > 0) {
+        allocation.default_values = memnew_arr(Variant, total_default_count);
+        allocation.default_value_ptrs = memnew_arr(GDExtensionVariantPtr, total_default_count);
+    }
+
+    uint32_t argument_offset = 0;
+    uint32_t default_offset = 0;
+    for (uint32_t i = 0; i < method_count; ++i) {
+        const Dictionary method = methods[static_cast<int32_t>(i)];
+        allocation.method_names[i] = StringName(method.get("name", ""));
+
+        Dictionary return_info = method.get("return", Dictionary());
+        if (return_info.is_empty()) {
+            return_info["name"] = String();
+            return_info["type"] = static_cast<int64_t>(Variant::NIL);
+            return_info["hint"] = static_cast<int64_t>(PROPERTY_HINT_NONE);
+            return_info["hint_string"] = String();
+            return_info["usage"] = static_cast<int64_t>(PROPERTY_USAGE_DEFAULT);
+        }
+        fill_property_info_from_dictionary(
+                return_info,
+                allocation.return_infos[i],
+                allocation.return_names[i],
+                allocation.return_class_names[i],
+                allocation.return_hint_strings[i],
+                String());
+
+        const Array args = method.get("args", Array());
+        for (int32_t arg_index = 0; arg_index < args.size(); ++arg_index) {
+            const Dictionary arg_info = args[arg_index];
+            fill_property_info_from_dictionary(
+                    arg_info,
+                    allocation.argument_infos[argument_offset],
+                    allocation.argument_names[argument_offset],
+                    allocation.argument_class_names[argument_offset],
+                    allocation.argument_hint_strings[argument_offset],
+                    String("arg") + String::num_int64(arg_index));
+            ++argument_offset;
+        }
+
+        const Array default_args = method.get("default_args", Array());
+        for (int32_t default_index = 0; default_index < default_args.size(); ++default_index) {
+            allocation.default_values[default_offset] = default_args[default_index];
+            allocation.default_value_ptrs[default_offset] = &allocation.default_values[default_offset];
+            ++default_offset;
+        }
+
+        GDExtensionMethodInfo &info = allocation.infos[i];
+        info.name = &allocation.method_names[i];
+        info.return_value = allocation.return_infos[i];
+        info.flags = METHOD_FLAG_NORMAL;
+        info.id = 0;
+        info.argument_count = static_cast<uint32_t>(args.size());
+        info.arguments = info.argument_count > 0 ? &allocation.argument_infos[argument_offset - static_cast<uint32_t>(args.size())] : nullptr;
+        info.default_argument_count = static_cast<uint32_t>(default_args.size());
+        info.default_arguments = info.default_argument_count > 0 ? &allocation.default_value_ptrs[default_offset - static_cast<uint32_t>(default_args.size())] : nullptr;
+    }
+
+    const GDExtensionMethodInfo *list = allocation.infos;
+    g_script_method_lists.emplace(list, std::move(allocation));
+    *r_count = method_count;
+    return list;
 }
 
-void instance_free_method_list(GDExtensionScriptInstanceDataPtr, const GDExtensionMethodInfo *, uint32_t) {
+void instance_free_method_list(GDExtensionScriptInstanceDataPtr, const GDExtensionMethodInfo *p_list, uint32_t) {
+    auto found = g_script_method_lists.find(p_list);
+    if (found == g_script_method_lists.end()) {
+        return;
+    }
+
+    ScriptMethodListAllocation &allocation = found->second;
+    memdelete_arr(allocation.infos);
+    memdelete_arr(allocation.method_names);
+    memdelete_arr(allocation.return_infos);
+    memdelete_arr(allocation.return_names);
+    memdelete_arr(allocation.return_class_names);
+    memdelete_arr(allocation.return_hint_strings);
+    if (allocation.argument_infos != nullptr) {
+        memdelete_arr(allocation.argument_infos);
+        memdelete_arr(allocation.argument_names);
+        memdelete_arr(allocation.argument_class_names);
+        memdelete_arr(allocation.argument_hint_strings);
+    }
+    if (allocation.default_values != nullptr) {
+        memdelete_arr(allocation.default_values);
+        memdelete_arr(allocation.default_value_ptrs);
+    }
+    g_script_method_lists.erase(found);
 }
 
 GDExtensionVariantType instance_get_property_type(GDExtensionScriptInstanceDataPtr p_instance, GDExtensionConstStringNamePtr p_name, GDExtensionBool *r_is_valid) {
@@ -407,9 +570,25 @@ GDExtensionBool instance_has_method(GDExtensionScriptInstanceDataPtr p_instance,
     return false;
 }
 
-GDExtensionInt instance_get_method_argument_count(GDExtensionScriptInstanceDataPtr, GDExtensionConstStringNamePtr, GDExtensionBool *r_is_valid) {
-    *r_is_valid = true;
-    return 0;
+GDExtensionInt instance_get_method_argument_count(GDExtensionScriptInstanceDataPtr p_instance, GDExtensionConstStringNamePtr p_name, GDExtensionBool *r_is_valid) {
+    if (r_is_valid != nullptr) {
+        *r_is_valid = false;
+    }
+    KorkScriptInstance *instance = static_cast<KorkScriptInstance *>(p_instance);
+    if (instance == nullptr || !instance->script.is_valid()) {
+        return 0;
+    }
+
+    const StringName &name = *reinterpret_cast<const StringName *>(p_name);
+    const Variant count_value = instance->script->_get_script_method_argument_count(name);
+    if (count_value.get_type() != Variant::INT) {
+        return 0;
+    }
+
+    if (r_is_valid != nullptr) {
+        *r_is_valid = true;
+    }
+    return static_cast<GDExtensionInt>(static_cast<int64_t>(count_value));
 }
 
 void instance_call(GDExtensionScriptInstanceDataPtr p_self, GDExtensionConstStringNamePtr p_method, const GDExtensionConstVariantPtr *p_args, GDExtensionInt p_argument_count, GDExtensionVariantPtr r_return, GDExtensionCallError *r_error) {
