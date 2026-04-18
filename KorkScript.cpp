@@ -613,6 +613,7 @@ KorkScript::MethodArgumentMetadata parse_method_argument(const VarNode *argument
 
 struct AstScriptMetadata {
     String inferred_namespace_name;
+    String declared_script_class_name;
     String declared_script_class_parent_name;
     std::unordered_set<std::string> method_names;
     std::unordered_map<std::string, KorkScript::MethodMetadata> method_metadata;
@@ -685,6 +686,9 @@ KorkApi::AstEnumerationControl collect_script_metadata_from_ast(void *user_ptr, 
                 const ClassDeclStmtNode *class_node = static_cast<const ClassDeclStmtNode *>(info->stmtNode);
                 if (class_node != nullptr && out->inferred_namespace_name.is_empty() && class_node->className != nullptr) {
                     out->inferred_namespace_name = String(class_node->className);
+                }
+                if (class_node != nullptr && class_node->className != nullptr) {
+                    out->declared_script_class_name = String(class_node->className);
                 }
                 if (class_node != nullptr && out->declared_script_class_parent_name.is_empty() && class_node->parentName != nullptr) {
                     out->declared_script_class_parent_name = String(class_node->parentName);
@@ -783,6 +787,7 @@ KorkScript::KorkScript() :
         vm_name_("default"),
         namespace_name_(""),
         inferred_namespace_name_(""),
+        declared_script_class_name_(""),
         declared_script_class_parent_name_(""),
         base_type_("Node"),
         tool_enabled_(false),
@@ -793,14 +798,26 @@ KorkScript::~KorkScript() {
 }
 
 void KorkScript::set_source_code(const String &source) {
+    assign_source_code(source, true, true);
+}
+
+void KorkScript::set_source_code_silent(const String &source) {
+    assign_source_code(source, false, false);
+}
+
+void KorkScript::assign_source_code(const String &source, bool notify_language, bool emit_changed_signal) {
     source_code_ = source;
     ++revision_;
     refresh_method_cache();
-    KorkScriptLanguage *language = KorkScriptLanguage::get_singleton();
-    if (language != nullptr) {
-        language->notify_script_changed(this);
+    if (notify_language) {
+        KorkScriptLanguage *language = KorkScriptLanguage::get_singleton();
+        if (language != nullptr) {
+            language->notify_script_changed(this);
+        }
     }
-    emit_changed();
+    if (emit_changed_signal) {
+        emit_changed();
+    }
 }
 
 void KorkScript::set_vm_name(const String &vm_name) {
@@ -845,6 +862,14 @@ const String &KorkScript::get_source_code_ref() const {
 
 const String &KorkScript::get_declared_script_class_parent_name() const {
     return declared_script_class_parent_name_;
+}
+
+String KorkScript::get_declared_script_class_name() const {
+    return declared_script_class_name_;
+}
+
+bool KorkScript::has_declared_script_class() const {
+    return !declared_script_class_name_.is_empty();
 }
 
 bool KorkScript::get_tool_enabled() const {
@@ -1297,17 +1322,6 @@ void KorkScript::_bind_methods() {
 }
 
 void KorkScript::refresh_method_cache() {
-    previous_class_field_metadata_ = class_field_metadata_;
-    method_names_.clear();
-    method_metadata_.clear();
-    method_order_.clear();
-    signal_names_.clear();
-    signal_metadata_.clear();
-    signal_order_.clear();
-    class_field_metadata_.clear();
-    class_field_order_.clear();
-    inferred_namespace_name_ = String();
-    declared_script_class_parent_name_ = String();
     KorkScriptLanguage *language = KorkScriptLanguage::get_singleton();
     KorkScriptVMHost *host = language != nullptr ? language->get_vm_host(vm_name_) : nullptr;
     if (host == nullptr) {
@@ -1315,8 +1329,19 @@ void KorkScript::refresh_method_cache() {
     }
 
     AstScriptMetadata metadata;
-    host->enumerate_ast(source_code_, String("[KorkScriptMetadata]"), &metadata, &collect_script_metadata_from_ast);
+    const KorkApi::AstEnumerationResult parse_result = host->enumerate_ast(
+            source_code_,
+            String("[KorkScriptMetadata]"),
+            &metadata,
+            &collect_script_metadata_from_ast,
+            nullptr);
+    if (parse_result != KorkApi::AstEnumerationCompleted) {
+        return;
+    }
+
+    previous_class_field_metadata_ = class_field_metadata_;
     inferred_namespace_name_ = std::move(metadata.inferred_namespace_name);
+    declared_script_class_name_ = std::move(metadata.declared_script_class_name);
     declared_script_class_parent_name_ = std::move(metadata.declared_script_class_parent_name);
     method_names_ = std::move(metadata.method_names);
     method_metadata_ = std::move(metadata.method_metadata);

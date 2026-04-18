@@ -48,9 +48,8 @@ String KorkScriptResourceFormatLoader::_get_resource_script_class(const String &
 
     Ref<KorkScript> script;
     script.instantiate();
-    script->set_path(p_path);
-    script->set_source_code(file->get_as_text());
-    return script->get_effective_namespace_name();
+    script->set_source_code_silent(file->get_as_text());
+    return script->has_declared_script_class() ? script->get_declared_script_class_name() : String();
 }
 
 bool KorkScriptResourceFormatLoader::_exists(const String &p_path) const {
@@ -69,8 +68,7 @@ Variant KorkScriptResourceFormatLoader::_load(const String &p_path, const String
 
     Ref<KorkScript> script;
     script.instantiate();
-    script->set_path(p_path);
-    script->set_source_code(file->get_as_text());
+    script->set_source_code_silent(file->get_as_text());
     return script;
 }
 

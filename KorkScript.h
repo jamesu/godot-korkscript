@@ -19,6 +19,7 @@ public:
     ~KorkScript() override;
 
     void set_source_code(const String &source);
+    void set_source_code_silent(const String &source);
     void set_vm_name(const String &vm_name);
     void set_namespace_name(const String &namespace_name);
     void set_base_type(const String &base_type);
@@ -29,6 +30,8 @@ public:
     const String &get_base_type() const;
     const String &get_source_code_ref() const;
     const String &get_declared_script_class_parent_name() const;
+    String get_declared_script_class_name() const;
+    bool has_declared_script_class() const;
     bool get_tool_enabled() const;
     String get_effective_namespace_name() const;
     uint64_t get_revision() const;
@@ -104,6 +107,7 @@ public:
     };
 
 private:
+    void assign_source_code(const String &source, bool notify_language, bool emit_changed_signal);
     void refresh_method_cache();
     const MethodMetadata *get_method_metadata(const StringName &method) const;
     const SignalMetadata *get_signal_metadata(const StringName &signal) const;
@@ -114,6 +118,7 @@ private:
     String vm_name_;
     String namespace_name_;
     String inferred_namespace_name_;
+    String declared_script_class_name_;
     String declared_script_class_parent_name_;
     String base_type_;
     bool tool_enabled_;
