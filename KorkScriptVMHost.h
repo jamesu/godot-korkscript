@@ -5,6 +5,7 @@
 #include <godot_cpp/classes/ref.hpp>
 #include <godot_cpp/variant/string.hpp>
 #include <godot_cpp/variant/string_name.hpp>
+#include <godot_cpp/variant/array.hpp>
 #include <godot_cpp/variant/dictionary.hpp>
 #include <godot_cpp/variant/typed_array.hpp>
 #include <godot_cpp/variant/variant.hpp>
@@ -30,6 +31,16 @@ public:
     const String &get_vm_name() const;
     uint64_t get_generation() const;
     KorkApi::AstEnumerationResult enumerate_ast(const String &code, const String &filename, void *user_ptr, KorkApi::AstEnumerationCallback callback, KorkApi::AstParseErrorInfo *out_error = nullptr) const;
+    void process_frame();
+    int32_t get_last_debug_break_line() const;
+    String get_last_debug_break_source() const;
+    bool is_debug_pause_active() const;
+    Dictionary get_debug_stack_level_locals(int32_t stack_level, int32_t max_subitems, int32_t max_depth) const;
+    Dictionary get_debug_stack_level_members(int32_t stack_level, int32_t max_subitems, int32_t max_depth) const;
+    void *get_debug_stack_level_instance(int32_t stack_level) const;
+    Dictionary get_debug_globals(int32_t max_subitems, int32_t max_depth) const;
+    String debug_parse_stack_level_expression(int32_t stack_level, const String &expression, int32_t max_subitems, int32_t max_depth) const;
+    Variant debug_variant_from_console_value(KorkApi::ConsoleValue value) const { return variant_from_console_value(value); }
 
     bool ensure_script_loaded(const KorkScript *script);
     void notify_script_changed(const KorkScript *script);
@@ -98,6 +109,8 @@ private:
     static KorkApi::ConsoleValue object_get_object_callback(void *obj, void *user_ptr, int32_t argc, KorkApi::ConsoleValue argv[]);
     static KorkApi::ConsoleValue object_get_count_callback(void *obj, void *user_ptr, int32_t argc, KorkApi::ConsoleValue argv[]);
     static KorkApi::ConsoleValue object_kork_ctor_callback(void *obj, void *user_ptr, int32_t argc, KorkApi::ConsoleValue argv[]);
+    static bool debug_is_breakpoint_callback(void *user_ptr, int32_t line, const char *source);
+    static void debug_on_break_callback(void *user_ptr, int32_t line, const char *source);
 
     void initialize_vm();
     void reset_vm();
@@ -156,6 +169,11 @@ private:
     KorkApi::ConsoleValue bridge_global_get_word(int32_t argc, KorkApi::ConsoleValue argv[]) const;
     KorkApi::ConsoleValue bridge_global_is_object(int32_t argc, KorkApi::ConsoleValue argv[]) const;
     void trigger_godot_signal(Object *owner, StringTableEntry signal_name, int argc, KorkApi::ConsoleValue *argv) const;
+    int32_t to_debug_frame_index(int32_t stack_level) const;
+    KorkApi::VMObject *get_debug_frame_vm_object(int32_t stack_level) const;
+    Object *get_debug_frame_owner(int32_t stack_level) const;
+    Object *get_debug_this_owner(int32_t stack_level) const;
+    Dictionary build_debug_variable_dictionary(const char *names_key, const PackedStringArray &names, const Array &values) const;
 
     Variant variant_from_console_value(KorkApi::ConsoleValue value) const;
     KorkApi::ConsoleValue console_value_from_variant(const Variant &value) const;
@@ -200,12 +218,21 @@ private:
     std::unordered_map<uint64_t, ActiveScriptState> active_scripts_;
     std::unordered_map<uint64_t, Ref<KorkScript>> known_scripts_;
     std::unordered_map<uint64_t, ScriptLoadState> loaded_scripts_;
+    struct TelnetAdapter;
+    std::unique_ptr<TelnetAdapter> telnet_adapter_;
+    int debugger_port_;
+    String debugger_password_;
+    bool debugger_enabled_;
     std::vector<KorkApi::Vm *> retired_vms_;
     mutable KorkApi::SimObjectId next_sim_id_;
     uint64_t generation_;
     bool reload_pending_;
     int script_instance_field_write_depth_;
     int script_instance_field_read_depth_;
+    int32_t last_debug_break_line_;
+    String last_debug_break_source_;
+    bool debug_pause_active_;
+    bool debug_breakpoint_sync_active_;
     mutable std::vector<uint64_t> execution_target_stack_;
     mutable std::unordered_set<uint64_t> property_probe_owner_ids_;
 };

@@ -20,6 +20,7 @@ public:
     static KorkScriptLanguage *get_singleton();
     KorkScriptVMHost *get_vm_host(const String &vm_name);
     void notify_script_changed(const KorkScript *script);
+    void set_active_debug_vm_name(const String &vm_name);
 
     String _get_name() const override;
     void _init() override;
@@ -48,6 +49,16 @@ public:
     ScriptNameCasing _preferred_file_name_casing() const override;
     void _thread_enter() override;
     void _thread_exit() override;
+    String _debug_get_error() const override;
+    int32_t _debug_get_stack_level_count() const override;
+    int32_t _debug_get_stack_level_line(int32_t p_level) const override;
+    String _debug_get_stack_level_function(int32_t p_level) const override;
+    String _debug_get_stack_level_source(int32_t p_level) const override;
+    Dictionary _debug_get_stack_level_locals(int32_t p_level, int32_t p_max_subitems, int32_t p_max_depth) override;
+    Dictionary _debug_get_stack_level_members(int32_t p_level, int32_t p_max_subitems, int32_t p_max_depth) override;
+    void *_debug_get_stack_level_instance(int32_t p_level) override;
+    Dictionary _debug_get_globals(int32_t p_max_subitems, int32_t p_max_depth) override;
+    String _debug_parse_stack_level_expression(int32_t p_level, const String &p_expression, int32_t p_max_subitems, int32_t p_max_depth) override;
     TypedArray<Dictionary> _debug_get_current_stack_info() override;
     PackedStringArray _get_recognized_extensions() const override;
     TypedArray<Dictionary> _get_public_functions() const override;
@@ -61,8 +72,10 @@ protected:
     static void _bind_methods();
 
 private:
+    KorkScriptVMHost *get_debug_host() const;
     static KorkScriptLanguage *singleton_;
     std::unordered_map<std::string, std::unique_ptr<KorkScriptVMHost>> vm_hosts_;
+    String active_debug_vm_name_;
 };
 
 } // namespace godot

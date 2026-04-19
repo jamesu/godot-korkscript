@@ -23,6 +23,17 @@ namespace godot {
 KorkScriptLanguage *KorkScriptLanguage::singleton_ = nullptr;
 
 namespace {
+int32_t to_vm_frame_index(KorkApi::Vm *vm, int32_t stack_level) {
+    if (vm == nullptr || stack_level < 0) {
+        return -1;
+    }
+    const int32_t depth = vm->getCurrentFiberFrameDepth();
+    if (depth < 0 || stack_level > depth) {
+        return -1;
+    }
+    return depth - stack_level;
+}
+
 struct FunctionEntry {
     String name;
     int32_t line = -1;
@@ -1347,6 +1358,10 @@ void KorkScriptLanguage::notify_script_changed(const KorkScript *script) {
     }
 }
 
+void KorkScriptLanguage::set_active_debug_vm_name(const String &vm_name) {
+    active_debug_vm_name_ = vm_name;
+}
+
 String KorkScriptLanguage::_get_name() const {
     return KORKSCRIPT_LANGUAGE_NAME;
 }
@@ -1788,8 +1803,181 @@ void KorkScriptLanguage::_thread_enter() {
 void KorkScriptLanguage::_thread_exit() {
 }
 
+KorkScriptVMHost *KorkScriptLanguage::get_debug_host() const {
+    if (!active_debug_vm_name_.is_empty()) {
+        const CharString active_utf8 = active_debug_vm_name_.utf8();
+        const std::string active_key(active_utf8.get_data(), static_cast<size_t>(active_utf8.length()));
+        auto active_found = vm_hosts_.find(active_key);
+        if (active_found != vm_hosts_.end() && active_found->second != nullptr && active_found->second->get_vm() != nullptr && active_found->second->is_debug_pause_active()) {
+            return active_found->second.get();
+        }
+    }
+
+    KorkScriptVMHost *fallback = nullptr;
+    for (const auto &entry : vm_hosts_) {
+        KorkScriptVMHost *host = entry.second.get();
+        if (host == nullptr) {
+            continue;
+        }
+        KorkApi::Vm *vm = host->get_vm();
+        if (vm == nullptr) {
+            continue;
+        }
+        if (!host->is_debug_pause_active()) {
+            continue;
+        }
+        if (vm->dbgIsConnected()) {
+            return host;
+        }
+        if (vm->getCurrentFiberFrameDepth() >= 0) {
+            return host;
+        }
+        if (fallback == nullptr) {
+            fallback = host;
+        }
+    }
+    return fallback;
+}
+
+String KorkScriptLanguage::_debug_get_error() const {
+    KorkScriptVMHost *host = get_debug_host();
+    KorkApi::Vm *vm = host != nullptr ? host->get_vm() : nullptr;
+    if (vm == nullptr || vm->getCurrentFiberState() != KorkApi::FiberRunResult::ERROR) {
+        return String();
+    }
+    StringTableEntry file = nullptr;
+    U32 line = 0;
+    if (vm->getCurrentFiberFileLine(&file, &line) && file != nullptr) {
+        return vformat("%s:%d", String(file), static_cast<int64_t>(line));
+    }
+    return String("KorkScript runtime error");
+}
+
+int32_t KorkScriptLanguage::_debug_get_stack_level_count() const {
+    KorkScriptVMHost *host = get_debug_host();
+    KorkApi::Vm *vm = host != nullptr ? host->get_vm() : nullptr;
+    if (vm == nullptr) {
+        return 0;
+    }
+    const int32_t depth = vm->getCurrentFiberFrameDepth();
+    return depth >= 0 ? depth + 1 : 0;
+}
+
+int32_t KorkScriptLanguage::_debug_get_stack_level_line(int32_t p_level) const {
+    KorkScriptVMHost *host = get_debug_host();
+    KorkApi::Vm *vm = host != nullptr ? host->get_vm() : nullptr;
+    if (vm == nullptr || host == nullptr) {
+        return 1;
+    }
+
+    if (p_level == 0) {
+        if (host->is_debug_pause_active()) {
+            return host->get_last_debug_break_line();
+        }
+        StringTableEntry file = nullptr;
+        U32 line = 0;
+        if (vm->getCurrentFiberFileLine(&file, &line) && line > 0) {
+            return static_cast<int32_t>(line);
+        }
+        return host->get_last_debug_break_line();
+    }
+
+    const int32_t frame = to_vm_frame_index(vm, p_level);
+    if (frame < 0) {
+        return host->get_last_debug_break_line();
+    }
+
+    const KorkApi::FiberFrameInfo info = vm->getCurrentFiberFrameInfo(frame);
+    if (info.line > 0) {
+        return static_cast<int32_t>(info.line);
+    }
+
+    return host->get_last_debug_break_line();
+}
+
+String KorkScriptLanguage::_debug_get_stack_level_function(int32_t p_level) const {
+    KorkScriptVMHost *host = get_debug_host();
+    KorkApi::Vm *vm = host != nullptr ? host->get_vm() : nullptr;
+    const int32_t frame = to_vm_frame_index(vm, p_level);
+    if (frame < 0) {
+        return String();
+    }
+    const KorkApi::FiberFrameInfo info = vm->getCurrentFiberFrameInfo(frame);
+    return info.scopeName != nullptr ? String(info.scopeName) : String();
+}
+
+String KorkScriptLanguage::_debug_get_stack_level_source(int32_t p_level) const {
+    KorkScriptVMHost *host = get_debug_host();
+    KorkApi::Vm *vm = host != nullptr ? host->get_vm() : nullptr;
+    if (vm == nullptr || host == nullptr) {
+        return String("<korkscript>");
+    }
+    if (p_level == 0) {
+        if (host->is_debug_pause_active()) {
+            return host->get_last_debug_break_source();
+        }
+        StringTableEntry file = nullptr;
+        U32 line = 0;
+        if (vm->getCurrentFiberFileLine(&file, &line) && file != nullptr) {
+            return String(file);
+        }
+        return host->get_last_debug_break_source();
+    }
+
+    const int32_t frame = to_vm_frame_index(vm, p_level);
+    if (frame >= 0) {
+        const KorkApi::FiberFrameInfo info = vm->getCurrentFiberFrameInfo(frame);
+        if (info.fullPath != nullptr) {
+            return String(info.fullPath);
+        }
+    }
+    return host->get_last_debug_break_source();
+}
+
+Dictionary KorkScriptLanguage::_debug_get_stack_level_locals(int32_t p_level, int32_t p_max_subitems, int32_t) {
+    KorkScriptVMHost *host = get_debug_host();
+    return host != nullptr ? host->get_debug_stack_level_locals(p_level, p_max_subitems, -1) : Dictionary();
+}
+
+Dictionary KorkScriptLanguage::_debug_get_stack_level_members(int32_t p_level, int32_t p_max_subitems, int32_t) {
+    KorkScriptVMHost *host = get_debug_host();
+    return host != nullptr ? host->get_debug_stack_level_members(p_level, p_max_subitems, -1) : Dictionary();
+}
+
+void *KorkScriptLanguage::_debug_get_stack_level_instance(int32_t p_level) {
+    KorkScriptVMHost *host = get_debug_host();
+    return host != nullptr ? host->get_debug_stack_level_instance(p_level) : nullptr;
+}
+
+Dictionary KorkScriptLanguage::_debug_get_globals(int32_t p_max_subitems, int32_t) {
+    KorkScriptVMHost *host = get_debug_host();
+    return host != nullptr ? host->get_debug_globals(p_max_subitems, -1) : Dictionary();
+}
+
+String KorkScriptLanguage::_debug_parse_stack_level_expression(int32_t p_level, const String &p_expression, int32_t, int32_t) {
+    KorkScriptVMHost *host = get_debug_host();
+    return host != nullptr ? host->debug_parse_stack_level_expression(p_level, p_expression, -1, -1) : String();
+}
+
 TypedArray<Dictionary> KorkScriptLanguage::_debug_get_current_stack_info() {
-    return TypedArray<Dictionary>();
+    TypedArray<Dictionary> out;
+    const int32_t count = _debug_get_stack_level_count();
+    for (int32_t i = 0; i < count; ++i) {
+        Dictionary entry;
+        const String source = _debug_get_stack_level_source(i);
+        const String function = _debug_get_stack_level_function(i);
+        int32_t line = _debug_get_stack_level_line(i);
+        if (line <= 0) {
+            line = 1;
+        }
+        entry["source"] = source;
+        entry["file"] = source;
+        entry["func"] = function;
+        entry["function"] = function;
+        entry["line"] = line;
+        out.push_back(entry);
+    }
+    return out;
 }
 
 PackedStringArray KorkScriptLanguage::_get_recognized_extensions() const {
@@ -1812,6 +2000,11 @@ TypedArray<Dictionary> KorkScriptLanguage::_get_public_annotations() const {
 }
 
 void KorkScriptLanguage::_frame() {
+    for (auto &entry : vm_hosts_) {
+        if (entry.second != nullptr) {
+            entry.second->process_frame();
+        }
+    }
 }
 
 bool KorkScriptLanguage::_handles_global_class_type(const String &p_type) const {

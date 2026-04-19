@@ -1,16 +1,21 @@
 #include "KorkScriptVMHost.h"
 
 #include "KorkScript.h"
+#include "KorkScriptLanguage.h"
 #include "embed/compilerOpcodes.h"
 #include "ext/korkscript/engine/console/ast.h"
 
 #include <godot_cpp/classes/class_db_singleton.hpp>
+#include <godot_cpp/classes/engine.hpp>
+#include <godot_cpp/classes/engine_debugger.hpp>
 #include <godot_cpp/classes/node.hpp>
 #include <godot_cpp/classes/object.hpp>
+#include <godot_cpp/classes/os.hpp>
 #include <godot_cpp/classes/scene_tree.hpp>
 #include <godot_cpp/classes/window.hpp>
 #include <godot_cpp/classes/global_constants.hpp>
 #include <godot_cpp/core/class_db.hpp>
+#include <godot_cpp/core/gdextension_interface_loader.hpp>
 #include <godot_cpp/variant/array.hpp>
 #include <godot_cpp/variant/callable.hpp>
 #include <godot_cpp/variant/dictionary.hpp>
@@ -24,13 +29,97 @@
 #include <cstdio>
 #include <cmath>
 #include <cstring>
+#include <cstdlib>
+#include <chrono>
+#include <thread>
 #include <unordered_set>
+
+#ifndef _WIN32
+#include <arpa/inet.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
+#endif
 
 namespace godot {
 
 namespace {
 
 KorkApi::FieldInfo g_empty_field_info{};
+
+bool env_flag_enabled(const char *name) {
+    const char *value = std::getenv(name);
+    if (value == nullptr) {
+        return false;
+    }
+    return std::strcmp(value, "1") == 0 || std::strcmp(value, "true") == 0 || std::strcmp(value, "TRUE") == 0;
+}
+
+String normalize_debug_source(const String &source) {
+    String normalized = source.strip_edges();
+    if (normalized.is_empty()) {
+        return String("<korkscript>");
+    }
+
+    const int builtin_sep = normalized.find("::");
+    String base = builtin_sep >= 0 ? normalized.substr(0, builtin_sep) : normalized;
+    const String suffix = builtin_sep >= 0 ? normalized.substr(builtin_sep) : String();
+
+    if (base.begins_with("/")) {
+        base = String("res://") + base.substr(1);
+    } else if (!base.begins_with("res://") && base.find("://") < 0) {
+        base = String("res://") + base;
+    }
+
+    return base + suffix;
+}
+
+bool has_editor_breakpoint_exact(EngineDebugger *debugger, int32_t line, const String &normalized_source) {
+    if (debugger == nullptr || line <= 0) {
+        return false;
+    }
+
+    const String src = normalized_source.strip_edges();
+    if (src.is_empty()) {
+        return false;
+    }
+
+    PackedStringArray source_candidates;
+    source_candidates.push_back(src);
+    source_candidates.push_back(src.to_lower());
+
+    const int sep = src.find("::");
+    if (sep > 0) {
+        const String without_builtin = src.substr(0, sep);
+        source_candidates.push_back(without_builtin);
+        source_candidates.push_back(without_builtin.to_lower());
+    }
+
+    const String file_name = src.get_file();
+    if (!file_name.is_empty()) {
+        source_candidates.push_back(file_name);
+        source_candidates.push_back(file_name.to_lower());
+    }
+
+    for (int i = 0; i < source_candidates.size(); ++i) {
+        if (debugger->is_breakpoint(line, StringName(source_candidates[i]))) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+int env_int_or_default(const char *name, int fallback) {
+    const char *value = std::getenv(name);
+    if (value == nullptr || value[0] == '\0') {
+        return fallback;
+    }
+    const int parsed = std::atoi(value);
+    return parsed > 0 ? parsed : fallback;
+}
 
 std::string make_node_path_key(Node *node) {
     if (node == nullptr || !node->is_inside_tree()) {
@@ -638,6 +727,319 @@ Variant::Type variant_type_from_kork_type_id(U32 type_id, U32 vector2_type_id, U
 
 } // namespace
 
+struct KorkScriptVMHost::TelnetAdapter {
+    struct Client {
+        int fd = -1;
+#ifndef _WIN32
+        sockaddr_in addr{};
+#endif
+        bool active = false;
+    };
+
+    KorkScriptVMHost *host = nullptr;
+    KorkApi::TelnetInterface iface{};
+    std::unordered_map<KorkApi::TelnetSocket, int> listeners;
+    std::unordered_map<U32, Client> clients;
+    U32 next_socket_id = 1;
+
+    explicit TelnetAdapter(KorkScriptVMHost *p_host) : host(p_host) {
+        iface.StartListenFn = &TelnetAdapter::start_listen_thunk;
+        iface.StopListenFn = &TelnetAdapter::stop_listen_thunk;
+        iface.CheckSocketActiveFn = &TelnetAdapter::check_socket_active_thunk;
+        iface.CheckAcceptFn = &TelnetAdapter::check_accept_thunk;
+        iface.CheckListenFn = &TelnetAdapter::check_listen_thunk;
+        iface.StopSocketFn = &TelnetAdapter::stop_socket_thunk;
+        iface.SendDataFn = &TelnetAdapter::send_data_thunk;
+        iface.RecvDataFn = &TelnetAdapter::recv_data_thunk;
+        iface.GetSocketAddressFn = &TelnetAdapter::get_socket_address_thunk;
+        iface.QueueEvaluateFn = &TelnetAdapter::queue_evaluate_thunk;
+        iface.YieldExecFn = &TelnetAdapter::yield_exec_thunk;
+    }
+
+    ~TelnetAdapter() {
+        for (auto &entry : clients) {
+            close_socket(entry.second.fd);
+        }
+        clients.clear();
+
+        for (auto &entry : listeners) {
+            close_socket(entry.second);
+        }
+        listeners.clear();
+    }
+
+    const KorkApi::TelnetInterface &get_interface() const {
+        return iface;
+    }
+
+    static TelnetAdapter *self(void *user) {
+        return static_cast<TelnetAdapter *>(user);
+    }
+
+    static bool start_listen_thunk(void *user, KorkApi::TelnetSocket kind, int port) {
+        return self(user)->start_listen(kind, port);
+    }
+    static bool stop_listen_thunk(void *user, KorkApi::TelnetSocket kind) {
+        return self(user)->stop_listen(kind);
+    }
+    static bool check_socket_active_thunk(void *user, U32 socket) {
+        return self(user)->check_socket_active(socket);
+    }
+    static U32 check_accept_thunk(void *user, KorkApi::TelnetSocket kind) {
+        return self(user)->check_accept(kind);
+    }
+    static bool check_listen_thunk(void *user, KorkApi::TelnetSocket kind) {
+        return self(user)->check_listen(kind);
+    }
+    static bool stop_socket_thunk(void *user, U32 socket) {
+        return self(user)->stop_socket(socket);
+    }
+    static void send_data_thunk(void *user, U32 socket, U32 bytes, const void *data) {
+        self(user)->send_data(socket, bytes, data);
+    }
+    static bool recv_data_thunk(void *user, U32 socket, void *data, U32 buffer_bytes, U32 *out_bytes) {
+        return self(user)->recv_data(socket, data, buffer_bytes, out_bytes);
+    }
+    static void get_socket_address_thunk(void *user, U32 socket, char *buffer) {
+        self(user)->get_socket_address(socket, buffer);
+    }
+    static void queue_evaluate_thunk(void *user, const char *evaluate_str) {
+        self(user)->queue_evaluate(evaluate_str);
+    }
+    static void yield_exec_thunk(void *user) {
+        self(user)->yield_exec();
+    }
+
+    static void close_socket(int fd) {
+        if (fd < 0) {
+            return;
+        }
+#ifdef _WIN32
+        (void)fd;
+#else
+        ::close(fd);
+#endif
+    }
+
+    bool start_listen(KorkApi::TelnetSocket kind, int port) {
+#ifdef _WIN32
+        (void)kind;
+        (void)port;
+        return false;
+#else
+        stop_listen(kind);
+
+        const int listen_fd = ::socket(AF_INET, SOCK_STREAM, 0);
+        if (listen_fd < 0) {
+            return false;
+        }
+
+        int reuse = 1;
+        ::setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+        if (::fcntl(listen_fd, F_SETFL, O_NONBLOCK) != 0) {
+            close_socket(listen_fd);
+            return false;
+        }
+
+        sockaddr_in addr{};
+        addr.sin_family = AF_INET;
+        addr.sin_addr.s_addr = htonl(INADDR_ANY);
+        addr.sin_port = htons(static_cast<uint16_t>(port));
+        if (::bind(listen_fd, reinterpret_cast<const sockaddr *>(&addr), sizeof(addr)) != 0) {
+            close_socket(listen_fd);
+            return false;
+        }
+        if (::listen(listen_fd, 8) != 0) {
+            close_socket(listen_fd);
+            return false;
+        }
+
+        listeners[kind] = listen_fd;
+        return true;
+#endif
+    }
+
+    bool stop_listen(KorkApi::TelnetSocket kind) {
+        auto found = listeners.find(kind);
+        if (found == listeners.end()) {
+            return false;
+        }
+        close_socket(found->second);
+        listeners.erase(found);
+        return true;
+    }
+
+    bool check_listen(KorkApi::TelnetSocket kind) const {
+        return listeners.find(kind) != listeners.end();
+    }
+
+    U32 check_accept(KorkApi::TelnetSocket kind) {
+#ifdef _WIN32
+        (void)kind;
+        return 0;
+#else
+        auto found = listeners.find(kind);
+        if (found == listeners.end()) {
+            return 0;
+        }
+
+        sockaddr_in remote_addr{};
+        socklen_t remote_len = sizeof(remote_addr);
+        const int client_fd = ::accept(found->second, reinterpret_cast<sockaddr *>(&remote_addr), &remote_len);
+        if (client_fd < 0) {
+            return 0;
+        }
+
+        ::fcntl(client_fd, F_SETFL, O_NONBLOCK);
+        const U32 client_id = next_socket_id++;
+        Client client;
+        client.fd = client_fd;
+        client.addr = remote_addr;
+        client.active = true;
+        clients[client_id] = client;
+        return client_id;
+#endif
+    }
+
+    bool check_socket_active(U32 socket_id) {
+        auto found = clients.find(socket_id);
+        return found != clients.end() && found->second.active;
+    }
+
+    bool stop_socket(U32 socket_id) {
+        auto found = clients.find(socket_id);
+        if (found == clients.end()) {
+            return false;
+        }
+        close_socket(found->second.fd);
+        clients.erase(found);
+        return true;
+    }
+
+    void send_data(U32 socket_id, U32 bytes, const void *data) {
+        auto found = clients.find(socket_id);
+        if (found == clients.end() || found->second.fd < 0 || data == nullptr || bytes == 0) {
+            return;
+        }
+
+#ifndef _WIN32
+        const ssize_t sent = ::send(found->second.fd, data, static_cast<size_t>(bytes), 0);
+        if (sent < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+            stop_socket(socket_id);
+        }
+#endif
+    }
+
+    bool recv_data(U32 socket_id, void *data, U32 buffer_bytes, U32 *out_bytes) {
+        if (out_bytes != nullptr) {
+            *out_bytes = 0;
+        }
+        auto found = clients.find(socket_id);
+        if (found == clients.end() || found->second.fd < 0 || data == nullptr || buffer_bytes == 0) {
+            return false;
+        }
+
+#ifdef _WIN32
+        (void)buffer_bytes;
+        return false;
+#else
+        const ssize_t read_size = ::recv(found->second.fd, data, static_cast<size_t>(buffer_bytes), 0);
+        if (read_size == 0) {
+            stop_socket(socket_id);
+            return false;
+        }
+        if (read_size < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                return true;
+            }
+            stop_socket(socket_id);
+            return false;
+        }
+        if (out_bytes != nullptr) {
+            *out_bytes = static_cast<U32>(read_size);
+        }
+        return true;
+#endif
+    }
+
+    void get_socket_address(U32 socket_id, char *buffer) {
+        if (buffer == nullptr) {
+            return;
+        }
+        buffer[0] = '\0';
+
+        auto found = clients.find(socket_id);
+        if (found == clients.end()) {
+            std::snprintf(buffer, 256, "invalid");
+            return;
+        }
+
+#ifdef _WIN32
+        std::snprintf(buffer, 256, "unsupported");
+#else
+        char ip[INET_ADDRSTRLEN] = {};
+        if (::inet_ntop(AF_INET, &found->second.addr.sin_addr, ip, sizeof(ip)) == nullptr) {
+            std::snprintf(buffer, 256, "unknown");
+            return;
+        }
+        std::snprintf(buffer, 256, "%s:%u", ip, static_cast<unsigned>(ntohs(found->second.addr.sin_port)));
+#endif
+    }
+
+    void queue_evaluate(const char *evaluate_str) {
+        if (host == nullptr || host->get_vm() == nullptr) {
+            return;
+        }
+        host->get_vm()->evalCode(evaluate_str != nullptr ? evaluate_str : "", "[korkscript-debugger]", "");
+    }
+
+    void yield_exec() {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+};
+
+struct DebugVariableCapture {
+    const KorkScriptVMHost *host = nullptr;
+    PackedStringArray names;
+    Array values;
+    int32_t max_items = -1;
+    int32_t count = 0;
+};
+
+void capture_debug_variable(KorkApi::Vm *, void *user_ptr, const char *name, KorkApi::ConsoleValue value) {
+    DebugVariableCapture *capture = static_cast<DebugVariableCapture *>(user_ptr);
+    if (capture == nullptr || capture->host == nullptr || name == nullptr) {
+        return;
+    }
+    if (capture->max_items >= 0 && capture->count >= capture->max_items) {
+        return;
+    }
+
+    capture->names.push_back(String(name));
+    capture->values.push_back(capture->host->debug_variant_from_console_value(value));
+    ++capture->count;
+}
+
+struct DebugThisCapture {
+    KorkApi::Vm *vm = nullptr;
+    String value;
+    bool found = false;
+};
+
+void capture_debug_this(KorkApi::Vm *vm, void *user_ptr, const char *name, KorkApi::ConsoleValue value) {
+    DebugThisCapture *capture = static_cast<DebugThisCapture *>(user_ptr);
+    if (capture == nullptr || vm == nullptr || name == nullptr || capture->found) {
+        return;
+    }
+    if (String(name) != "%this") {
+        return;
+    }
+
+    capture->vm = vm;
+    capture->value = String(vm->valueAsString(value));
+    capture->found = true;
+}
+
 KorkScriptVMHost::KorkScriptVMHost(const String &vm_name) :
         vm_name_(vm_name),
         vm_(nullptr),
@@ -646,11 +1048,35 @@ KorkScriptVMHost::KorkScriptVMHost(const String &vm_name) :
         vector3_type_id_(-1),
         vector4_type_id_(-1),
         color_type_id_(-1),
+        debugger_port_(0),
+        debugger_password_(""),
+        debugger_enabled_(false),
         next_sim_id_(1),
         generation_(1),
         reload_pending_(false),
         script_instance_field_write_depth_(0),
-        script_instance_field_read_depth_(0) {
+        script_instance_field_read_depth_(0),
+        last_debug_break_line_(1),
+        last_debug_break_source_("<korkscript>"),
+        debug_pause_active_(false),
+        debug_breakpoint_sync_active_(false) {
+    const bool is_editor_process = Engine::get_singleton() != nullptr && Engine::get_singleton()->is_editor_hint();
+    debugger_port_ = env_int_or_default("KORKSCRIPT_DEBUGGER_PORT", 0);
+    debugger_enabled_ = debugger_port_ > 0 || env_flag_enabled("KORKSCRIPT_DEBUGGER");
+    if (debugger_enabled_ && debugger_port_ <= 0) {
+        debugger_port_ = 6115;
+    }
+    if (is_editor_process) {
+        if (debugger_enabled_) {
+            UtilityFunctions::print("[korkscript-debug] debugger disabled in editor process");
+        }
+        debugger_enabled_ = false;
+        debugger_port_ = 0;
+    }
+    if (const char *password = std::getenv("KORKSCRIPT_DEBUGGER_PASSWORD")) {
+        debugger_password_ = String(password);
+    }
+    telnet_adapter_ = std::make_unique<TelnetAdapter>(this);
     initialize_vm();
 }
 
@@ -664,6 +1090,7 @@ void KorkScriptVMHost::initialize_vm() {
     };
     cfg.logFn = &KorkScriptVMHost::log_callback;
     cfg.logUser = this;
+    cfg.vmUser = this;
     cfg.iFind.FindObjectByNameFn = &KorkScriptVMHost::find_by_name_callback;
     cfg.iFind.FindObjectByPathFn = &KorkScriptVMHost::find_by_path_callback;
     cfg.iFind.FindObjectByIdFn = &KorkScriptVMHost::find_by_id_callback;
@@ -675,10 +1102,27 @@ void KorkScriptVMHost::initialize_vm() {
     cfg.warnUndefinedScriptVariables = true;
     cfg.enableSignals = true;
     cfg.enableScriptClasses = true;
+    cfg.debugIsBreakpointFn = &KorkScriptVMHost::debug_is_breakpoint_callback;
+    cfg.debugOnBreakFn = &KorkScriptVMHost::debug_on_break_callback;
     cfg.maxFibers = 128;
     cfg.defaultScriptClass = "GodotObject";
+    if (debugger_enabled_ && telnet_adapter_ != nullptr) {
+        cfg.initTelnet = true;
+        cfg.iTelnet = telnet_adapter_->get_interface();
+        cfg.telnetUser = telnet_adapter_.get();
+    }
 
     vm_ = KorkApi::createVM(&cfg);
+    if (vm_ == nullptr) {
+        UtilityFunctions::push_error("[korkscript] Failed to create VM instance");
+        return;
+    }
+
+    if (vm_ != nullptr && debugger_enabled_ && debugger_port_ > 0) {
+        const CharString password_utf8 = debugger_password_.utf8();
+        vm_->dbgSetParameters(debugger_port_, password_utf8.get_data(), false);
+        UtilityFunctions::print(vformat("[korkscript-debug] debugger listening on port %d", static_cast<int64_t>(debugger_port_)));
+    }
     KorkApi::TypeInfo vector2_info{};
     vector2_info.name = vm_->internString("Vector2");
     vector2_info.userPtr = &vector2_type_id_;
@@ -773,6 +1217,209 @@ uint64_t KorkScriptVMHost::get_generation() const {
     return generation_;
 }
 
+int32_t KorkScriptVMHost::get_last_debug_break_line() const {
+    return last_debug_break_line_ > 0 ? last_debug_break_line_ : 1;
+}
+
+String KorkScriptVMHost::get_last_debug_break_source() const {
+    return last_debug_break_source_.is_empty() ? String("<korkscript>") : last_debug_break_source_;
+}
+
+bool KorkScriptVMHost::is_debug_pause_active() const {
+    return debug_pause_active_;
+}
+
+int32_t KorkScriptVMHost::to_debug_frame_index(int32_t stack_level) const {
+    if (vm_ == nullptr || stack_level < 0) {
+        return -1;
+    }
+
+    const int32_t depth = vm_->getCurrentFiberFrameDepth();
+    if (depth < 0 || stack_level > depth) {
+        return -1;
+    }
+
+    return depth - stack_level;
+}
+
+KorkApi::VMObject *KorkScriptVMHost::get_debug_frame_vm_object(int32_t stack_level) const {
+    if (vm_ == nullptr) {
+        return nullptr;
+    }
+
+    const int32_t frame = to_debug_frame_index(stack_level);
+    if (frame < 0) {
+        return nullptr;
+    }
+
+    return vm_->getCurrentFiberFrameObject(frame);
+}
+
+Object *KorkScriptVMHost::get_debug_frame_owner(int32_t stack_level) const {
+    KorkApi::VMObject *vm_object = get_debug_frame_vm_object(stack_level);
+    return vm_object != nullptr ? static_cast<Object *>(vm_object->userPtr) : nullptr;
+}
+
+Object *KorkScriptVMHost::get_debug_this_owner(int32_t stack_level) const {
+    if (vm_ == nullptr) {
+        return nullptr;
+    }
+
+    const int32_t frame = to_debug_frame_index(stack_level);
+    if (frame < 0) {
+        return nullptr;
+    }
+
+    DebugThisCapture capture;
+    if (vm_->enumLocals(&capture, &capture_debug_this, frame) && capture.found) {
+        Object *resolved = resolve_object_reference(get_debug_frame_owner(stack_level), capture.value);
+        if (resolved != nullptr) {
+            return resolved;
+        }
+    }
+
+    return get_debug_frame_owner(stack_level);
+}
+
+Dictionary KorkScriptVMHost::build_debug_variable_dictionary(const char *names_key, const PackedStringArray &names, const Array &values) const {
+    Dictionary out;
+    if (names_key == nullptr || names.is_empty() || names.size() != values.size()) {
+        return out;
+    }
+
+    out[String(names_key)] = names;
+    out["values"] = values;
+    return out;
+}
+
+Dictionary KorkScriptVMHost::get_debug_stack_level_locals(int32_t stack_level, int32_t max_subitems, int32_t) const {
+    if (vm_ == nullptr) {
+        return Dictionary();
+    }
+
+    const int32_t frame = to_debug_frame_index(stack_level);
+    if (frame < 0) {
+        return Dictionary();
+    }
+
+    DebugVariableCapture capture;
+    capture.host = this;
+    capture.max_items = max_subitems;
+    if (!vm_->enumLocals(&capture, &capture_debug_variable, frame)) {
+        return Dictionary();
+    }
+
+    return build_debug_variable_dictionary("locals", capture.names, capture.values);
+}
+
+Dictionary KorkScriptVMHost::get_debug_stack_level_members(int32_t stack_level, int32_t max_subitems, int32_t) const {
+    Object *owner = get_debug_this_owner(stack_level);
+    KorkApi::VMObject *vm_object = owner != nullptr ? const_cast<KorkScriptVMHost *>(this)->get_or_create_vm_object(owner, nullptr) : nullptr;
+    if (vm_object == nullptr) {
+        return Dictionary();
+    }
+
+    PackedStringArray names;
+    Array values;
+    const TypedArray<Dictionary> fields = get_instance_field_list(vm_object);
+    for (int i = 0; i < fields.size(); ++i) {
+        if (max_subitems >= 0 && names.size() >= max_subitems) {
+            break;
+        }
+
+        const Dictionary field_info = fields[i];
+        const StringName field_name = StringName(field_info.get("name", String()));
+        if (field_name.is_empty()) {
+            continue;
+        }
+
+        Variant value;
+        if (!get_instance_field(vm_object, field_name, value)) {
+            continue;
+        }
+
+        names.push_back(String(field_name));
+        values.push_back(value);
+    }
+
+    return build_debug_variable_dictionary("members", names, values);
+}
+
+void *KorkScriptVMHost::get_debug_stack_level_instance(int32_t stack_level) const {
+    (void)stack_level;
+    // Returning a raw ScriptInstance pointer through the debugger bridge is currently
+    // unstable for this extension path and can crash the remote debugger while paused.
+    // Members are still exposed separately through %this-based lookup.
+    return nullptr;
+}
+
+Dictionary KorkScriptVMHost::get_debug_globals(int32_t max_subitems, int32_t) const {
+    if (vm_ == nullptr) {
+        return Dictionary();
+    }
+
+    DebugVariableCapture capture;
+    capture.host = this;
+    capture.max_items = max_subitems;
+    vm_->enumGlobals("$*", &capture, &capture_debug_variable);
+    return build_debug_variable_dictionary("globals", capture.names, capture.values);
+}
+
+String KorkScriptVMHost::debug_parse_stack_level_expression(int32_t stack_level, const String &expression, int32_t, int32_t) const {
+    if (vm_ == nullptr) {
+        return String();
+    }
+
+    const int32_t frame = to_debug_frame_index(stack_level);
+    const String trimmed = expression.strip_edges();
+    if (frame < 0 || trimmed.is_empty()) {
+        return String();
+    }
+
+    bool looks_like_statement = trimmed.find(";") >= 0 ||
+            trimmed.find("\n") >= 0 ||
+            trimmed.begins_with("return ") ||
+            trimmed.begins_with("if ") ||
+            trimmed.begins_with("while ") ||
+            trimmed.begins_with("for ") ||
+            trimmed.begins_with("switch ") ||
+            trimmed.begins_with("break") ||
+            trimmed.begins_with("continue");
+    if (!looks_like_statement) {
+        const int assign_pos = trimmed.find("=");
+        if (assign_pos >= 0) {
+            const char32_t before = assign_pos > 0 ? trimmed[assign_pos - 1] : 0;
+            const char32_t after = assign_pos + 1 < trimmed.length() ? trimmed[assign_pos + 1] : 0;
+            looks_like_statement = before != '=' && before != '!' && before != '<' && before != '>' && after != '=';
+        }
+    }
+
+    String source = trimmed;
+    if (!looks_like_statement) {
+        source = String("return ") + trimmed + ";";
+    }
+
+    const CharString expr_utf8 = source.utf8();
+    const KorkApi::ConsoleValue value = vm_->evalCode(expr_utf8.get_data(), "[korkscript-debug-eval]", "", frame);
+    return String(vm_->valueAsString(value));
+}
+
+void KorkScriptVMHost::process_frame() {
+    if (vm_ == nullptr) {
+        return;
+    }
+    // Breakpoint sync must run in the runtime process, not the editor process.
+    if (Engine::get_singleton() != nullptr && Engine::get_singleton()->is_editor_hint()) {
+        return;
+    }
+    debug_breakpoint_sync_active_ = true;
+    vm_->syncDebugBreakpoints();
+    debug_breakpoint_sync_active_ = false;
+    if (debugger_enabled_) {
+        vm_->processTelnet();
+    }
+}
+
 KorkApi::AstEnumerationResult KorkScriptVMHost::enumerate_ast(const String &code, const String &filename, void *user_ptr, KorkApi::AstEnumerationCallback callback, KorkApi::AstParseErrorInfo *out_error) const {
     if (vm_ == nullptr || callback == nullptr) {
         return KorkApi::AstEnumerationParseFailed;
@@ -848,11 +1495,14 @@ bool KorkScriptVMHost::eval_script_source(const KorkScript *script) {
     }
 
     const CharString source_utf8 = source_code.utf8();
-    String filename = script->get_effective_namespace_name().strip_edges();
+    String filename = script->get_path().strip_edges();
     if (filename.is_empty()) {
-        filename = String("KorkScript");
+        filename = script->get_effective_namespace_name().strip_edges();
+        if (filename.is_empty()) {
+            filename = String("KorkScript");
+        }
+        filename = vformat("res://%s_%s.ks", vm_name_, filename);
     }
-    filename = vformat("res://%s_%s.ks", vm_name_, filename);
     const CharString path_utf8 = filename.utf8();
 
     vm_->evalCode(source_utf8.get_data(), path_utf8.get_data(), "");
@@ -2248,6 +2898,77 @@ KorkApi::ConsoleValue KorkScriptVMHost::object_get_count_callback(void *obj, voi
 
 KorkApi::ConsoleValue KorkScriptVMHost::object_kork_ctor_callback(void *, void *, int32_t, KorkApi::ConsoleValue[]) {
     return KorkApi::ConsoleValue();
+}
+
+bool KorkScriptVMHost::debug_is_breakpoint_callback(void *user_ptr, int32_t line, const char *source) {
+    KorkScriptVMHost *self = static_cast<KorkScriptVMHost *>(user_ptr);
+    EngineDebugger *debugger = EngineDebugger::get_singleton();
+    if (debugger == nullptr || !debugger->is_active()) {
+        return false;
+    }
+
+    const String normalized_source = normalize_debug_source(String(source != nullptr ? source : ""));
+
+    const bool has_manual_breakpoint = !debugger->is_skipping_breakpoints() && has_editor_breakpoint_exact(debugger, line, normalized_source);
+    if (self != nullptr && self->debug_breakpoint_sync_active_) {
+        return has_manual_breakpoint;
+    }
+
+    const bool has_runtime_step_break = self != nullptr && self->get_vm() != nullptr && self->get_vm()->debugIsBreakOnNextStatement();
+    return has_manual_breakpoint || has_runtime_step_break;
+}
+
+void KorkScriptVMHost::debug_on_break_callback(void *user_ptr, int32_t line, const char *source) {
+    KorkScriptVMHost *self = static_cast<KorkScriptVMHost *>(user_ptr);
+    const String normalized_source = normalize_debug_source(String(source != nullptr ? source : ""));
+    if (self != nullptr) {
+        self->last_debug_break_line_ = line > 0 ? line : 1;
+        self->last_debug_break_source_ = normalized_source;
+    }
+
+    EngineDebugger *debugger = EngineDebugger::get_singleton();
+    KorkScriptLanguage *language = KorkScriptLanguage::get_singleton();
+    if (debugger == nullptr || language == nullptr) {
+        return;
+    }
+
+    const bool has_manual_breakpoint = !debugger->is_skipping_breakpoints() && has_editor_breakpoint_exact(debugger, line, normalized_source);
+    const bool has_runtime_step_break = self != nullptr && self->get_vm() != nullptr && self->get_vm()->debugIsBreakOnNextStatement();
+    if (!has_manual_breakpoint && !has_runtime_step_break) {
+        return;
+    }
+
+    if (self != nullptr && has_runtime_step_break && self->get_vm() != nullptr) {
+        self->get_vm()->debugContinueExecution();
+    }
+
+    if (self != nullptr) {
+        language->set_active_debug_vm_name(self->get_vm_name());
+        self->debug_pause_active_ = true;
+    }
+    debugger->script_debug(language, true, false);
+
+    if (self != nullptr) {
+        self->debug_pause_active_ = false;
+        if (self->get_vm() == nullptr) {
+            return;
+        }
+
+        const int32_t next_lines_left = debugger->get_lines_left();
+        const int32_t next_depth = debugger->get_depth();
+        if (next_lines_left > 0) {
+            if (next_depth < 0) {
+                self->get_vm()->debugStepIn();
+            } else if (next_depth == 0) {
+                self->get_vm()->debugStepOver();
+            } else {
+                self->get_vm()->debugStepOut();
+            }
+            return;
+        }
+
+        self->get_vm()->debugContinueExecution();
+    }
 }
 
 KorkApi::NamespaceId KorkScriptVMHost::ensure_namespace_for_class(const StringName &class_name) {
