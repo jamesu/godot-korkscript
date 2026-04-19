@@ -233,6 +233,7 @@ private:
     String last_debug_break_source_;
     bool debug_pause_active_;
     bool debug_breakpoint_sync_active_;
+    mutable bool debug_eval_active_;
     mutable std::vector<uint64_t> execution_target_stack_;
     mutable std::unordered_set<uint64_t> property_probe_owner_ids_;
 };

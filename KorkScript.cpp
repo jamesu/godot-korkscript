@@ -140,6 +140,7 @@ struct KorkScriptInstance {
     Ref<KorkScript> script;
     KorkScriptVMHost *host = nullptr;
     KorkApi::VMObject *vm_object = nullptr;
+    void *script_instance_handle = nullptr;
     uint64_t host_generation = 0;
     bool in_native_fallback = false;
 };
@@ -1341,6 +1342,24 @@ StringName KorkScript::_get_instance_base_type() const {
     return StringName(base_type_);
 }
 
+void *KorkScript::get_instance_debug_handle(Object *owner) {
+    if (owner == nullptr) {
+        return nullptr;
+    }
+
+    KorkScriptLanguage *language = KorkScriptLanguage::get_singleton();
+    if (language == nullptr) {
+        return nullptr;
+    }
+
+    KorkScriptInstance *instance = static_cast<KorkScriptInstance *>(
+            gdextension_interface::object_get_script_instance(owner->_owner, language->_owner));
+    if (instance == nullptr) {
+        return nullptr;
+    }
+    return instance->script_instance_handle;
+}
+
 void *KorkScript::_instance_create(Object *p_for_object) const {
     KorkScriptLanguage *language = KorkScriptLanguage::get_singleton();
     if (language == nullptr) {
@@ -1359,7 +1378,8 @@ void *KorkScript::_instance_create(Object *p_for_object) const {
     instance->host->retain_script(this);
     instance->vm_object = host->create_vm_object_for(p_for_object, this);
     instance->host_generation = host->get_generation();
-    return gdextension_interface::script_instance_create3(&script_instance_info, instance);
+    instance->script_instance_handle = gdextension_interface::script_instance_create3(&script_instance_info, instance);
+    return instance->script_instance_handle;
 }
 
 void *KorkScript::_placeholder_instance_create(Object *) const {

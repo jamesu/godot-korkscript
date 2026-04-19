@@ -1059,7 +1059,8 @@ KorkScriptVMHost::KorkScriptVMHost(const String &vm_name) :
         last_debug_break_line_(1),
         last_debug_break_source_("<korkscript>"),
         debug_pause_active_(false),
-        debug_breakpoint_sync_active_(false) {
+        debug_breakpoint_sync_active_(false),
+        debug_eval_active_(false) {
     const bool is_editor_process = Engine::get_singleton() != nullptr && Engine::get_singleton()->is_editor_hint();
     debugger_port_ = env_int_or_default("KORKSCRIPT_DEBUGGER_PORT", 0);
     debugger_enabled_ = debugger_port_ > 0 || env_flag_enabled("KORKSCRIPT_DEBUGGER");
@@ -1346,11 +1347,11 @@ Dictionary KorkScriptVMHost::get_debug_stack_level_members(int32_t stack_level, 
 }
 
 void *KorkScriptVMHost::get_debug_stack_level_instance(int32_t stack_level) const {
-    (void)stack_level;
-    // Returning a raw ScriptInstance pointer through the debugger bridge is currently
-    // unstable for this extension path and can crash the remote debugger while paused.
-    // Members are still exposed separately through %this-based lookup.
-    return nullptr;
+    Object *owner = get_debug_this_owner(stack_level);
+    if (owner == nullptr) {
+        owner = get_debug_frame_owner(stack_level);
+    }
+    return owner != nullptr ? KorkScript::get_instance_debug_handle(owner) : nullptr;
 }
 
 Dictionary KorkScriptVMHost::get_debug_globals(int32_t max_subitems, int32_t) const {
@@ -1399,9 +1400,36 @@ String KorkScriptVMHost::debug_parse_stack_level_expression(int32_t stack_level,
         source = String("return ") + trimmed + ";";
     }
 
+    String assignment_target;
+    if (looks_like_statement) {
+        const int assign_pos = trimmed.find("=");
+        if (assign_pos > 0) {
+            const char32_t before = trimmed[assign_pos - 1];
+            const char32_t after = assign_pos + 1 < trimmed.length() ? trimmed[assign_pos + 1] : 0;
+            if (before != '=' && before != '!' && before != '<' && before != '>' && after != '=') {
+                assignment_target = trimmed.substr(0, assign_pos).strip_edges();
+                if (assignment_target.ends_with(";")) {
+                    assignment_target = assignment_target.left(-1).strip_edges();
+                }
+            }
+        }
+    }
+
+    KorkScriptVMHost *mutable_self = const_cast<KorkScriptVMHost *>(this);
+    mutable_self->debug_eval_active_ = true;
+
     const CharString expr_utf8 = source.utf8();
     const KorkApi::ConsoleValue value = vm_->evalCode(expr_utf8.get_data(), "[korkscript-debug-eval]", "", frame);
-    return String(vm_->valueAsString(value));
+    String result = String(vm_->valueAsString(value));
+    if (result.is_empty() && !assignment_target.is_empty()) {
+        const String probe = String("return ") + assignment_target + ";";
+        const CharString probe_utf8 = probe.utf8();
+        const KorkApi::ConsoleValue probe_value = vm_->evalCode(probe_utf8.get_data(), "[korkscript-debug-eval]", "", frame);
+        result = String(vm_->valueAsString(probe_value));
+    }
+
+    mutable_self->debug_eval_active_ = false;
+    return result;
 }
 
 void KorkScriptVMHost::process_frame() {
@@ -2904,6 +2932,9 @@ bool KorkScriptVMHost::debug_is_breakpoint_callback(void *user_ptr, int32_t line
     KorkScriptVMHost *self = static_cast<KorkScriptVMHost *>(user_ptr);
     EngineDebugger *debugger = EngineDebugger::get_singleton();
     if (debugger == nullptr || !debugger->is_active()) {
+        return false;
+    }
+    if (self != nullptr && self->debug_eval_active_) {
         return false;
     }
 

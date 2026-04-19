@@ -18,6 +18,8 @@ public:
     KorkScript();
     ~KorkScript() override;
 
+    static void *get_instance_debug_handle(Object *owner);
+
     void set_source_code(const String &source);
     void set_source_code_silent(const String &source);
     void set_vm_name(const String &vm_name);
